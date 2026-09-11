@@ -7,9 +7,9 @@ from flask import Flask, jsonify, redirect, render_template_string, request, url
 app = Flask(__name__)
 DB_PATH = os.getenv('PSX_BOT_DB', os.getenv('DATABASE_PATH', '/tmp/crypto_paper_bot.db'))
 SYMBOLS = ['ADAUSDT','XRPUSDT','DOGEUSDT','LINKUSDT','AVAXUSDT','DOTUSDT','LTCUSDT','BCHUSDT','ATOMUSDT','NEARUSDT','FILUSDT','APTUSDT','ARBUSDT','OPUSDT','INJUSDT','SUIUSDT','SEIUSDT','TIAUSDT','JTOUSDT','ETCUSDT']
-BINANCE_KLINES_URL='https://api.binance.com/api/v3/klines'
+BINANCE_KLINES_URL='https://demo-fapi.binance.com/fapi/v1/klines'
 STARTING_CAPITAL_RS=100.0
-STATE_VERSION="futures-usd-100-v2"
+STATE_VERSION="futures-demo-usd-100-v3"
 POSITION_PCT=0.10
 MAX_OPEN_POSITIONS=20
 EMA_FAST=9; EMA_SLOW=20; VOLUME_LOOKBACK=20; VOLUME_MULTIPLIER=1.20
@@ -121,7 +121,7 @@ def summary_data():
     return {'symbols':len(SYMBOLS),'trades':t,'wins':w,'losses':a['losses'] or 0,'win_rate':round((w/t*100) if t else 0,2),'costs':round(a['costs'],2),'net':round(a['net'],2),'capital':round(cash,2),'open':open_n}
 
 @app.route('/health')
-def health(): return jsonify(ok=True,mode='crypto-paper',symbols=len(SYMBOLS),worker_started=_worker_started,utc=datetime.now(timezone.utc).isoformat())
+def health(): return jsonify(ok=True,mode='crypto-futures-demo-paper',symbols=len(SYMBOLS),worker_started=_worker_started,utc=datetime.now(timezone.utc).isoformat())
 @app.route('/summary')
 def summary(): return jsonify(summary_data())
 @app.route('/trades')
@@ -133,7 +133,7 @@ def reset_demo():
         c=db(); c.execute('DELETE FROM trades'); c.execute('DELETE FROM positions'); c.execute('DELETE FROM processed_bars'); c.execute("INSERT INTO state(key,value) VALUES('cash_rs',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(str(STARTING_CAPITAL_RS),)); c.execute("INSERT INTO state(key,value) VALUES('state_version',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(STATE_VERSION,)); c.commit(); c.close()
     return redirect(url_for('dashboard'))
 
-HTML='''<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="20"><style>body{font-family:Arial;background:#10131a;color:#eee;padding:14px}.g{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:9px}.c{background:#1b202b;padding:12px;border-radius:10px}.l{font-size:12px;color:#aaa}.v{font-size:21px;font-weight:700}table{width:100%;border-collapse:collapse;background:#1b202b;margin-top:12px}td,th{padding:8px;border-bottom:1px solid #333;font-size:12px}.n{background:#1b202b;padding:12px;border-radius:10px;margin:14px 0}</style><h2>Crypto Futures 1m Automatic Paper Bot</h2><p>Binance public data • No API key • No real orders • 20 pairs</p><div class=g>{% for k,v in cards %}<div class=c><div class=l>{{k}}</div><div class=v>{{v}}</div></div>{% endfor %}</div><div class=n><b>Strategy:</b> EMA9 &gt; EMA20, close above VWAP & EMA9, volume ≥ 1.2× 20-bar average. TP +0.30%, SL -0.20%, max hold 10 bars, 10% virtual capital/trade. Fee 0.15%/side + slippage 0.05%/side.<br><br><b>Demo only.</b> Render Free can sleep, and SQLite data may disappear after restart/redeploy.</div><h3>Open Positions</h3><table><tr><th>Pair</th><th>Entry</th><th>$ Notional</th><th>Bars</th></tr>{% for p in positions %}<tr><td>{{p.symbol}}</td><td>{{p.entry_price}}</td><td>{{'%.2f'|format(p.notional_rs)}}</td><td>{{p.bars_held}}</td></tr>{% else %}<tr><td colspan=4>None</td></tr>{% endfor %}</table><h3>Latest Trades</h3><table><tr><th>Pair</th><th>Exit</th><th>P/L</th><th>Return</th></tr>{% for t in trades %}<tr><td>{{t.symbol}}</td><td>{{t.reason}}</td><td>Rs {{'%.2f'|format(t.net_pl_rs)}}</td><td>{{'%.3f'|format(t.return_pct)}}%</td></tr>{% else %}<tr><td colspan=4>No trades yet</td></tr>{% endfor %}</table><form method=post action=/reset_demo><p><button>Reset Demo</button></p></form>'''
+HTML='''<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="20"><style>body{font-family:Arial;background:#10131a;color:#eee;padding:14px}.g{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:9px}.c{background:#1b202b;padding:12px;border-radius:10px}.l{font-size:12px;color:#aaa}.v{font-size:21px;font-weight:700}table{width:100%;border-collapse:collapse;background:#1b202b;margin-top:12px}td,th{padding:8px;border-bottom:1px solid #333;font-size:12px}.n{background:#1b202b;padding:12px;border-radius:10px;margin:14px 0}</style><h2>Crypto Futures 1m Automatic Paper Bot</h2><p>Binance Futures Demo data • No API key • No real orders • 20 pairs</p><div class=g>{% for k,v in cards %}<div class=c><div class=l>{{k}}</div><div class=v>{{v}}</div></div>{% endfor %}</div><div class=n><b>Strategy:</b> EMA9 &gt; EMA20, close above VWAP & EMA9, volume ≥ 1.2× 20-bar average. TP +0.30%, SL -0.20%, max hold 10 bars, 10% virtual capital/trade. Fee 0.15%/side + slippage 0.05%/side.<br><br><b>Demo only.</b> Render Free can sleep, and SQLite data may disappear after restart/redeploy.</div><h3>Open Positions</h3><table><tr><th>Pair</th><th>Entry</th><th>$ Notional</th><th>Bars</th></tr>{% for p in positions %}<tr><td>{{p.symbol}}</td><td>{{p.entry_price}}</td><td>{{'%.2f'|format(p.notional_rs)}}</td><td>{{p.bars_held}}</td></tr>{% else %}<tr><td colspan=4>None</td></tr>{% endfor %}</table><h3>Latest Trades</h3><table><tr><th>Pair</th><th>Exit</th><th>P/L</th><th>Return</th></tr>{% for t in trades %}<tr><td>{{t.symbol}}</td><td>{{t.reason}}</td><td>$ {{'%.2f'|format(t.net_pl_rs)}}</td><td>{{'%.3f'|format(t.return_pct)}}%</td></tr>{% else %}<tr><td colspan=4>No trades yet</td></tr>{% endfor %}</table><form method=post action=/reset_demo><p><button>Reset Demo</button></p></form>'''
 
 @app.route('/')
 def dashboard():
