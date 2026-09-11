@@ -1,352 +1,141 @@
-
-from flask import Flask, request, jsonify, render_template_string
-import sqlite3, os, math, json
-from datetime import datetime
-
-APP_TITLE = "PSX All-Symbols 1m Paper Bot V1"
-DB_PATH = os.environ.get("PSX_BOT_DB", os.environ.get("DATABASE_PATH", "psx_paper_bot.db"))
-WEBHOOK_SECRET = os.environ.get("PSX_WEBHOOK_SECRET", "change-me")
-
-CFG = {
-    "starting_capital": 100000.0,
-    "position_size_pct": 0.10,
-    "ema_fast": 9,
-    "ema_slow": 20,
-    "volume_lookback": 20,
-    "volume_multiplier": 1.20,
-    "take_profit_pct": 0.0030,
-    "stop_loss_pct": 0.0020,
-    "max_hold_bars": 10,
-    "min_price": 5.0,
-    "min_bar_volume": 1000.0,
-    "commission_pct_per_side": 0.0015,
-    "slippage_pct_per_side": 0.0005,
-    "max_open_positions": 50
-}
+import os, json, sqlite3, threading, time
+from datetime import datetime, timezone
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+from flask import Flask, jsonify, redirect, render_template_string, request, url_for
 
 app = Flask(__name__)
+DB_PATH = os.getenv('PSX_BOT_DB', os.getenv('DATABASE_PATH', '/tmp/crypto_paper_bot.db'))
+SYMBOLS = ['ADAUSDT','XRPUSDT','DOGEUSDT','LINKUSDT','AVAXUSDT','DOTUSDT','LTCUSDT','BCHUSDT','ATOMUSDT','NEARUSDT','FILUSDT','APTUSDT','ARBUSDT','OPUSDT','INJUSDT','SUIUSDT','SEIUSDT','TIAUSDT','JTOUSDT','ETCUSDT']
+BINANCE_KLINES_URL='https://api.binance.com/api/v3/klines'
+STARTING_CAPITAL_RS=100000.0
+POSITION_PCT=0.10
+MAX_OPEN_POSITIONS=20
+EMA_FAST=9; EMA_SLOW=20; VOLUME_LOOKBACK=20; VOLUME_MULTIPLIER=1.20
+TAKE_PROFIT_PCT=0.0030; STOP_LOSS_PCT=0.0020; MAX_HOLD_BARS=10
+COMMISSION_PCT_PER_SIDE=0.0015; SLIPPAGE_PCT_PER_SIDE=0.0005
+POLL_SECONDS=20
+_db_lock=threading.Lock(); _worker_started=False; _worker_lock=threading.Lock()
 
 def db():
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
-    return con
+    c=sqlite3.connect(DB_PATH,timeout=30); c.row_factory=sqlite3.Row; return c
 
 def init_db():
-    con = db()
-    cur = con.cursor()
-    cur.executescript("""
-    CREATE TABLE IF NOT EXISTS candles(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      symbol TEXT NOT NULL,
-      ts TEXT NOT NULL,
-      open REAL NOT NULL,
-      high REAL NOT NULL,
-      low REAL NOT NULL,
-      close REAL NOT NULL,
-      volume REAL NOT NULL,
-      UNIQUE(symbol, ts)
-    );
-    CREATE INDEX IF NOT EXISTS idx_candles_symbol_ts ON candles(symbol, ts);
+    with _db_lock:
+        c=db(); c.executescript('''
+        CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS processed_bars(symbol TEXT NOT NULL, close_time_ms INTEGER NOT NULL, PRIMARY KEY(symbol,close_time_ms));
+        CREATE TABLE IF NOT EXISTS positions(symbol TEXT PRIMARY KEY, entry_time TEXT NOT NULL, entry_close_time_ms INTEGER NOT NULL, raw_entry_price REAL NOT NULL, entry_price REAL NOT NULL, notional_rs REAL NOT NULL, bars_held INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS trades(id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL, entry_time TEXT NOT NULL, exit_time TEXT NOT NULL, raw_entry_price REAL NOT NULL, entry_price REAL NOT NULL, raw_exit_price REAL NOT NULL, exit_price REAL NOT NULL, notional_rs REAL NOT NULL, gross_pl_rs REAL NOT NULL, commission_rs REAL NOT NULL, net_pl_rs REAL NOT NULL, return_pct REAL NOT NULL, reason TEXT NOT NULL);
+        ''')
+        if c.execute("SELECT 1 FROM state WHERE key='cash_rs'").fetchone() is None:
+            c.execute("INSERT INTO state(key,value) VALUES('cash_rs',?)",(str(STARTING_CAPITAL_RS),))
+        c.commit(); c.close()
 
-    CREATE TABLE IF NOT EXISTS positions(
-      symbol TEXT PRIMARY KEY,
-      entry_time TEXT NOT NULL,
-      entry_price REAL NOT NULL,
-      qty INTEGER NOT NULL,
-      allocated REAL NOT NULL,
-      entry_fee REAL NOT NULL,
-      tp REAL NOT NULL,
-      sl REAL NOT NULL,
-      bars_held INTEGER NOT NULL DEFAULT 0
-    );
+def ema(vals,p):
+    a=2/(p+1); out=[float(vals[0])]
+    for v in vals[1:]: out.append(a*float(v)+(1-a)*out[-1])
+    return out
 
-    CREATE TABLE IF NOT EXISTS trades(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      symbol TEXT NOT NULL,
-      entry_time TEXT NOT NULL,
-      exit_time TEXT NOT NULL,
-      entry_price REAL NOT NULL,
-      exit_price REAL NOT NULL,
-      qty INTEGER NOT NULL,
-      exit_reason TEXT NOT NULL,
-      gross_pl REAL NOT NULL,
-      total_costs REAL NOT NULL,
-      net_pl REAL NOT NULL
-    );
+def fetch_klines(symbol,limit=120):
+    q=urlencode({'symbol':symbol,'interval':'1m','limit':limit})
+    req=Request(BINANCE_KLINES_URL+'?'+q,headers={'User-Agent':'Mozilla/5.0'})
+    with urlopen(req,timeout=8) as r: raw=json.loads(r.read().decode())
+    now=int(time.time()*1000); out=[]
+    for k in raw:
+        if int(k[6])>=now: continue
+        out.append({'open_time_ms':int(k[0]),'close_time_ms':int(k[6]),'open':float(k[1]),'high':float(k[2]),'low':float(k[3]),'close':float(k[4]),'volume':float(k[5])})
+    return out
 
-    CREATE TABLE IF NOT EXISTS state(
-      key TEXT PRIMARY KEY,
-      value TEXT NOT NULL
-    );
-    """)
-    cur.execute("INSERT OR IGNORE INTO state(key,value) VALUES('cash',?)", (str(CFG["starting_capital"]),))
-    con.commit()
-    con.close()
+def signal_on_last_bar(cs):
+    if len(cs)<25: return False
+    closes=[x['close'] for x in cs]; vols=[x['volume'] for x in cs]; ef=ema(closes,9); es=ema(closes,20); last=cs[-1]
+    prev20=vols[-21:-1]; avg=sum(prev20)/len(prev20)
+    dt=datetime.fromtimestamp(last['close_time_ms']/1000,tz=timezone.utc); day0=datetime(dt.year,dt.month,dt.day,tzinfo=timezone.utc).timestamp()*1000
+    day=[x for x in cs if x['open_time_ms']>=day0]; vv=sum(x['volume'] for x in day); pv=sum(((x['high']+x['low']+x['close'])/3)*x['volume'] for x in day)
+    vwap=pv/vv if vv else last['close']
+    return ef[-1]>es[-1] and last['close']>vwap and last['close']>ef[-1] and last['volume']>=1.2*avg
 
-def get_cash(con):
-    row = con.execute("SELECT value FROM state WHERE key='cash'").fetchone()
-    return float(row["value"]) if row else CFG["starting_capital"]
+def current_cash(c): return float(c.execute("SELECT value FROM state WHERE key='cash_rs'").fetchone()['value'])
 
-def set_cash(con, value):
-    con.execute("INSERT OR REPLACE INTO state(key,value) VALUES('cash',?)", (str(float(value)),))
+def open_position(symbol,candle):
+    with _db_lock:
+        c=db()
+        if c.execute('SELECT 1 FROM positions WHERE symbol=?',(symbol,)).fetchone() or c.execute('SELECT COUNT(*) n FROM positions').fetchone()['n']>=MAX_OPEN_POSITIONS: c.close(); return
+        notional=current_cash(c)*POSITION_PCT; raw=candle['close']; entry=raw*(1+SLIPPAGE_PCT_PER_SIDE)
+        c.execute('INSERT INTO positions VALUES(?,?,?,?,?,?,0)',(symbol,datetime.fromtimestamp(candle['close_time_ms']/1000,tz=timezone.utc).isoformat(),candle['close_time_ms'],raw,entry,notional)); c.commit(); c.close()
 
-def ema(values, length):
-    if not values:
-        return None
-    alpha = 2.0 / (length + 1.0)
-    e = values[0]
-    for v in values[1:]:
-        e = alpha * v + (1-alpha) * e
-    return e
+def close_position(c,pos,candle,raw_exit,reason):
+    entry=float(pos['entry_price']); notional=float(pos['notional_rs']); exitp=float(raw_exit)*(1-SLIPPAGE_PCT_PER_SIDE); gross_ret=(exitp-entry)/entry; gross=notional*gross_ret
+    commission=notional*COMMISSION_PCT_PER_SIDE + max(0,notional*(1+gross_ret))*COMMISSION_PCT_PER_SIDE
+    net=gross-commission; cash=current_cash(c)+net
+    c.execute('INSERT INTO trades(symbol,entry_time,exit_time,raw_entry_price,entry_price,raw_exit_price,exit_price,notional_rs,gross_pl_rs,commission_rs,net_pl_rs,return_pct,reason) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',(pos['symbol'],pos['entry_time'],datetime.fromtimestamp(candle['close_time_ms']/1000,tz=timezone.utc).isoformat(),pos['raw_entry_price'],entry,raw_exit,exitp,notional,gross,commission,net,(net/notional)*100 if notional else 0,reason))
+    c.execute('DELETE FROM positions WHERE symbol=?',(pos['symbol'],)); c.execute("UPDATE state SET value=? WHERE key='cash_rs'",(str(cash),))
 
-def current_signal(con, symbol):
-    rows = con.execute(
-        "SELECT ts,close,volume FROM candles WHERE symbol=? ORDER BY ts DESC LIMIT 60",
-        (symbol,)
-    ).fetchall()
-    rows = list(reversed(rows))
-    if len(rows) < max(CFG["ema_slow"], CFG["volume_lookback"]) + 2:
-        return False, {}
+def process_position(symbol,candle):
+    with _db_lock:
+        c=db(); pos=c.execute('SELECT * FROM positions WHERE symbol=?',(symbol,)).fetchone()
+        if not pos or candle['close_time_ms']<=pos['entry_close_time_ms']: c.close(); return
+        bars=pos['bars_held']+1; entry=pos['entry_price']; tp=entry*(1+TAKE_PROFIT_PCT); sl=entry*(1-STOP_LOSS_PCT)
+        if candle['low']<=sl: close_position(c,pos,candle,sl,'SL')
+        elif candle['high']>=tp: close_position(c,pos,candle,tp,'TP')
+        elif bars>=MAX_HOLD_BARS: close_position(c,pos,candle,candle['close'],'TIME')
+        else: c.execute('UPDATE positions SET bars_held=? WHERE symbol=?',(bars,symbol))
+        c.commit(); c.close()
 
-    closes = [float(r["close"]) for r in rows]
-    vols = [float(r["volume"]) for r in rows]
-    last = rows[-1]
-    close = closes[-1]
-    vol = vols[-1]
-    ef = ema(closes[-60:], CFG["ema_fast"])
-    es = ema(closes[-60:], CFG["ema_slow"])
-    prior_vols = vols[-CFG["volume_lookback"]-1:-1]
-    vol_avg = sum(prior_vols) / len(prior_vols)
+def processed(symbol,t):
+    c=db(); r=c.execute('SELECT 1 FROM processed_bars WHERE symbol=? AND close_time_ms=?',(symbol,t)).fetchone(); c.close(); return bool(r)
 
-    # Session VWAP reconstructed from today's candles for this symbol
-    day = str(last["ts"])[:10]
-    day_rows = con.execute(
-        "SELECT close,volume FROM candles WHERE symbol=? AND substr(ts,1,10)=? ORDER BY ts",
-        (symbol, day)
-    ).fetchall()
-    pv = sum(float(r["close"]) * float(r["volume"]) for r in day_rows)
-    vv = sum(float(r["volume"]) for r in day_rows)
-    vwap = pv / vv if vv else close
+def mark(symbol,t):
+    c=db(); c.execute('INSERT OR IGNORE INTO processed_bars VALUES(?,?)',(symbol,t)); c.commit(); c.close()
 
-    signal = (
-        ef > es and
-        close > vwap and
-        close > ef and
-        vol >= vol_avg * CFG["volume_multiplier"] and
-        close >= CFG["min_price"] and
-        vol >= CFG["min_bar_volume"]
-    )
-    return signal, {
-        "ema_fast": round(ef,4), "ema_slow": round(es,4),
-        "vwap": round(vwap,4), "vol_avg": round(vol_avg,2)
-    }
+def process_symbol(symbol):
+    cs=fetch_klines(symbol); last=cs[-1] if cs else None
+    if not last or processed(symbol,last['close_time_ms']): return
+    process_position(symbol,last)
+    if signal_on_last_bar(cs): open_position(symbol,last)
+    mark(symbol,last['close_time_ms'])
 
-def process_candle(con, c):
-    symbol = c["symbol"].upper().strip()
-    ts = c["datetime"]
-    o,h,l,cl,v = map(float, [c["open"],c["high"],c["low"],c["close"],c["volume"]])
+def worker_loop():
+    time.sleep(3)
+    while True:
+        for s in SYMBOLS:
+            try: process_symbol(s)
+            except Exception as e: print('[worker]',s,type(e).__name__,e,flush=True)
+            time.sleep(.2)
+        time.sleep(POLL_SECONDS)
 
-    con.execute("""
-      INSERT OR IGNORE INTO candles(symbol,ts,open,high,low,close,volume)
-      VALUES(?,?,?,?,?,?,?)
-    """, (symbol,ts,o,h,l,cl,v))
+def ensure_worker():
+    global _worker_started
+    with _worker_lock:
+        if not _worker_started:
+            threading.Thread(target=worker_loop,daemon=True).start(); _worker_started=True
 
-    action = None
-    pos = con.execute("SELECT * FROM positions WHERE symbol=?", (symbol,)).fetchone()
+def summary_data():
+    c=db(); cash=current_cash(c); open_n=c.execute('SELECT COUNT(*) n FROM positions').fetchone()['n']; a=c.execute("SELECT COUNT(*) trades,SUM(CASE WHEN net_pl_rs>0 THEN 1 ELSE 0 END) wins,SUM(CASE WHEN net_pl_rs<=0 THEN 1 ELSE 0 END) losses,COALESCE(SUM(commission_rs),0) costs,COALESCE(SUM(net_pl_rs),0) net FROM trades").fetchone(); c.close()
+    t=a['trades'] or 0; w=a['wins'] or 0
+    return {'symbols':len(SYMBOLS),'trades':t,'wins':w,'losses':a['losses'] or 0,'win_rate':round((w/t*100) if t else 0,2),'costs':round(a['costs'],2),'net':round(a['net'],2),'capital':round(cash,2),'open':open_n}
 
-    # Manage exit on every new candle
-    if pos:
-        bars = int(pos["bars_held"]) + 1
-        exit_reason, raw_exit = None, None
-        if l <= float(pos["sl"]):
-            exit_reason, raw_exit = "SL", float(pos["sl"])
-        elif h >= float(pos["tp"]):
-            exit_reason, raw_exit = "TP", float(pos["tp"])
-        elif bars >= CFG["max_hold_bars"]:
-            exit_reason, raw_exit = "TIME", cl
-
-        if exit_reason:
-            exit_price = raw_exit * (1 - CFG["slippage_pct_per_side"])
-            qty = int(pos["qty"])
-            gross = (exit_price - float(pos["entry_price"])) * qty
-            exit_fee = exit_price * qty * CFG["commission_pct_per_side"]
-            entry_fee = float(pos["entry_fee"])
-            net = gross - entry_fee - exit_fee
-            cash = get_cash(con)
-            cash += float(pos["allocated"]) + gross - exit_fee
-            set_cash(con, cash)
-            con.execute("""
-              INSERT INTO trades(symbol,entry_time,exit_time,entry_price,exit_price,qty,exit_reason,gross_pl,total_costs,net_pl)
-              VALUES(?,?,?,?,?,?,?,?,?,?)
-            """, (symbol,pos["entry_time"],ts,float(pos["entry_price"]),exit_price,qty,exit_reason,gross,entry_fee+exit_fee,net))
-            con.execute("DELETE FROM positions WHERE symbol=?", (symbol,))
-            action = {"type":"EXIT","symbol":symbol,"reason":exit_reason,"net_pl":round(net,2)}
-            pos = None
-        else:
-            con.execute("UPDATE positions SET bars_held=? WHERE symbol=?", (bars,symbol))
-
-    # Entry after exit management
-    if not pos:
-        open_count = con.execute("SELECT COUNT(*) AS n FROM positions").fetchone()["n"]
-        if open_count < CFG["max_open_positions"]:
-            signal, ind = current_signal(con, symbol)
-            if signal:
-                cash = get_cash(con)
-                budget = cash * CFG["position_size_pct"]
-                entry_price = cl * (1 + CFG["slippage_pct_per_side"])
-                qty = int(budget // entry_price)
-                if qty > 0:
-                    allocated = qty * entry_price
-                    entry_fee = allocated * CFG["commission_pct_per_side"]
-                    debit = allocated + entry_fee
-                    if debit <= cash:
-                        set_cash(con, cash - debit)
-                        tp = entry_price * (1 + CFG["take_profit_pct"])
-                        sl = entry_price * (1 - CFG["stop_loss_pct"])
-                        con.execute("""
-                          INSERT OR REPLACE INTO positions(symbol,entry_time,entry_price,qty,allocated,entry_fee,tp,sl,bars_held)
-                          VALUES(?,?,?,?,?,?,?,?,0)
-                        """, (symbol,ts,entry_price,qty,allocated,entry_fee,tp,sl))
-                        action = {"type":"ENTRY","symbol":symbol,"entry":round(entry_price,4),"qty":qty,"tp":round(tp,4),"sl":round(sl,4), **ind}
-    return action
-
-def summary(con, day=None):
-    if day is None:
-        day = datetime.now().strftime("%Y-%m-%d")
-    tr = con.execute("SELECT * FROM trades WHERE substr(exit_time,1,10)=? ORDER BY exit_time DESC", (day,)).fetchall()
-    total = len(tr)
-    wins = sum(1 for r in tr if float(r["net_pl"]) > 0)
-    losses = total - wins
-    net = sum(float(r["net_pl"]) for r in tr)
-    gross = sum(float(r["gross_pl"]) for r in tr)
-    costs = sum(float(r["total_costs"]) for r in tr)
-    open_positions = con.execute("SELECT COUNT(*) AS n FROM positions").fetchone()["n"]
-    cash = get_cash(con)
-    return {
-        "date": day, "total_trades": total, "wins": wins, "losses": losses,
-        "win_rate": round((wins/total*100) if total else 0,2),
-        "gross_pl": round(gross,2), "costs": round(costs,2), "net_pl": round(net,2),
-        "cash": round(cash,2), "open_positions": open_positions
-    }
-
-init_db()
-
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    payload = request.get_json(force=True, silent=False)
-    if WEBHOOK_SECRET != "change-me":
-        supplied = request.headers.get("X-Webhook-Secret") or payload.get("secret")
-        if supplied != WEBHOOK_SECRET:
-            return jsonify({"ok":False,"error":"bad secret"}), 403
-
-    required = ["symbol","datetime","open","high","low","close","volume"]
-    missing = [x for x in required if x not in payload]
-    if missing:
-        return jsonify({"ok":False,"error":"missing fields","missing":missing}), 400
-
-    con = db()
-    try:
-        action = process_candle(con, payload)
-        con.commit()
-        s = summary(con, str(payload["datetime"])[:10])
-        return jsonify({"ok":True,"action":action,"summary":s})
-    finally:
-        con.close()
-
-@app.route("/summary")
-def summary_api():
-    day = request.args.get("date")
-    con = db()
-    try:
-        return jsonify(summary(con, day))
-    finally:
-        con.close()
-
-@app.route("/trades")
-def trades_api():
-    day = request.args.get("date", datetime.now().strftime("%Y-%m-%d"))
-    con = db()
-    try:
-        rows = con.execute("SELECT * FROM trades WHERE substr(exit_time,1,10)=? ORDER BY exit_time DESC", (day,)).fetchall()
-        return jsonify([dict(r) for r in rows])
-    finally:
-        con.close()
-
-@app.route("/reset_demo", methods=["POST"])
+@app.route('/health')
+def health(): return jsonify(ok=True,mode='crypto-paper',symbols=len(SYMBOLS),worker_started=_worker_started,utc=datetime.now(timezone.utc).isoformat())
+@app.route('/summary')
+def summary(): return jsonify(summary_data())
+@app.route('/trades')
+def trades():
+    c=db(); rows=[dict(x) for x in c.execute('SELECT * FROM trades ORDER BY id DESC LIMIT 200').fetchall()]; c.close(); return jsonify(rows)
+@app.route('/reset_demo',methods=['POST'])
 def reset_demo():
-    con = db()
-    try:
-        con.execute("DELETE FROM candles")
-        con.execute("DELETE FROM positions")
-        con.execute("DELETE FROM trades")
-        set_cash(con, CFG["starting_capital"])
-        con.commit()
-        return jsonify({"ok":True})
-    finally:
-        con.close()
+    with _db_lock:
+        c=db(); c.execute('DELETE FROM trades'); c.execute('DELETE FROM positions'); c.execute('DELETE FROM processed_bars'); c.execute("UPDATE state SET value=? WHERE key='cash_rs'",(str(STARTING_CAPITAL_RS),)); c.commit(); c.close()
+    return redirect(url_for('dashboard'))
 
-DASH = """
-<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<meta http-equiv="refresh" content="20">
-<title>{{title}}</title>
-<style>
-body{font-family:Arial;background:#101317;color:#eee;margin:24px}
-h1{font-size:24px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
-.card{background:#1a2027;padding:16px;border-radius:12px}.big{font-size:26px;font-weight:700;margin-top:8px}
-table{width:100%;border-collapse:collapse;margin-top:20px;background:#1a2027}
-th,td{padding:10px;border-bottom:1px solid #2c333b;text-align:right}th:first-child,td:first-child{text-align:left}
-.pos{color:#76e39b}.neg{color:#ff8585}.muted{color:#9da7b1}
-</style>
-</head>
-<body>
-<h1>PSX All-Symbols 1m Paper Bot V1</h1>
-<div class="muted">Auto refresh: 20 sec | Demo only | Date: {{s.date}}</div>
-<div class="grid">
- <div class="card">Trades<div class="big">{{s.total_trades}}</div></div>
- <div class="card">Wins<div class="big">{{s.wins}}</div></div>
- <div class="card">Losses<div class="big">{{s.losses}}</div></div>
- <div class="card">Win Rate<div class="big">{{s.win_rate}}%</div></div>
- <div class="card">Net P/L<div class="big {{'pos' if s.net_pl>=0 else 'neg'}}">Rs {{s.net_pl}}</div></div>
- <div class="card">Costs<div class="big">Rs {{s.costs}}</div></div>
- <div class="card">Cash<div class="big">Rs {{s.cash}}</div></div>
- <div class="card">Open Positions<div class="big">{{s.open_positions}}</div></div>
-</div>
+HTML='''<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="20"><style>body{font-family:Arial;background:#10131a;color:#eee;padding:14px}.g{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:9px}.c{background:#1b202b;padding:12px;border-radius:10px}.l{font-size:12px;color:#aaa}.v{font-size:21px;font-weight:700}table{width:100%;border-collapse:collapse;background:#1b202b;margin-top:12px}td,th{padding:8px;border-bottom:1px solid #333;font-size:12px}.n{background:#1b202b;padding:12px;border-radius:10px;margin:14px 0}</style><h2>Crypto Futures 1m Automatic Paper Bot</h2><p>Binance public data • No API key • No real orders • 20 pairs</p><div class=g>{% for k,v in cards %}<div class=c><div class=l>{{k}}</div><div class=v>{{v}}</div></div>{% endfor %}</div><div class=n><b>Strategy:</b> EMA9 &gt; EMA20, close above VWAP & EMA9, volume ≥ 1.2× 20-bar average. TP +0.30%, SL -0.20%, max hold 10 bars, 10% virtual capital/trade. Fee 0.15%/side + slippage 0.05%/side.<br><br><b>Demo only.</b> Render Free can sleep, and SQLite data may disappear after restart/redeploy.</div><h3>Open Positions</h3><table><tr><th>Pair</th><th>Entry</th><th>Rs Notional</th><th>Bars</th></tr>{% for p in positions %}<tr><td>{{p.symbol}}</td><td>{{p.entry_price}}</td><td>{{'%.2f'|format(p.notional_rs)}}</td><td>{{p.bars_held}}</td></tr>{% else %}<tr><td colspan=4>None</td></tr>{% endfor %}</table><h3>Latest Trades</h3><table><tr><th>Pair</th><th>Exit</th><th>P/L</th><th>Return</th></tr>{% for t in trades %}<tr><td>{{t.symbol}}</td><td>{{t.reason}}</td><td>Rs {{'%.2f'|format(t.net_pl_rs)}}</td><td>{{'%.3f'|format(t.return_pct)}}%</td></tr>{% else %}<tr><td colspan=4>No trades yet</td></tr>{% endfor %}</table><form method=post action=/reset_demo><p><button>Reset Demo</button></p></form>'''
 
-<h2>Latest Trades</h2>
-<table>
-<tr><th>Symbol</th><th>Entry</th><th>Exit</th><th>Qty</th><th>Reason</th><th>Net P/L</th></tr>
-{% for r in trades %}
-<tr>
-<td>{{r.symbol}}</td><td>{{"%.2f"|format(r.entry_price)}}</td><td>{{"%.2f"|format(r.exit_price)}}</td>
-<td>{{r.qty}}</td><td>{{r.exit_reason}}</td>
-<td class="{{'pos' if r.net_pl>=0 else 'neg'}}">{{"%.2f"|format(r.net_pl)}}</td>
-</tr>
-{% endfor %}
-</table>
-</body>
-</html>
-"""
-
-@app.route("/")
+@app.route('/')
 def dashboard():
-    day = request.args.get("date", datetime.now().strftime("%Y-%m-%d"))
-    con = db()
-    try:
-        s = summary(con, day)
-        trades = con.execute("SELECT * FROM trades WHERE substr(exit_time,1,10)=? ORDER BY exit_time DESC LIMIT 100", (day,)).fetchall()
-        return render_template_string(DASH, title=APP_TITLE, s=s, trades=trades)
-    finally:
-        con.close()
+    ensure_worker(); s=summary_data(); c=db(); pos=[dict(x) for x in c.execute('SELECT * FROM positions ORDER BY entry_time DESC')]; tr=[dict(x) for x in c.execute('SELECT * FROM trades ORDER BY id DESC LIMIT 50')]; c.close()
+    cards=[('Pairs',s['symbols']),('Trades',s['trades']),('Wins',s['wins']),('Losses',s['losses']),('Win Rate',str(s['win_rate'])+'%'),('Net P/L','Rs '+str(s['net'])),('Costs','Rs '+str(s['costs'])),('Capital','Rs '+str(s['capital'])),('Open',s['open'])]
+    return render_template_string(HTML,cards=cards,positions=pos,trades=tr)
 
-@app.route("/health")
-def health():
-    return jsonify({"ok": True, "service": APP_TITLE})
-
-if __name__ == "__main__":
-    init_db()
-    port = int(os.environ.get("PORT", "5000"))
-    print(f"Open dashboard on port {port}")
-    app.run(host="0.0.0.0", port=port, debug=False)
+init_db(); ensure_worker()
+if __name__=='__main__': app.run(host='0.0.0.0',port=int(os.getenv('PORT','8080')))
