@@ -7,18 +7,18 @@ from flask import Flask, jsonify, redirect, render_template_string, request, url
 app = Flask(__name__)
 DB_PATH = os.getenv('PSX_BOT_DB', os.getenv('DATABASE_PATH', '/tmp/crypto_paper_bot.db'))
 SYMBOLS = ['ADAUSDT','XRPUSDT','DOGEUSDT','LINKUSDT','AVAXUSDT','DOTUSDT','LTCUSDT','BCHUSDT','ATOMUSDT','NEARUSDT','FILUSDT','APTUSDT','ARBUSDT','OPUSDT','INJUSDT','SUIUSDT','SEIUSDT','TIAUSDT','JTOUSDT','ETCUSDT']
-KRAKEN_SYMBOL_MAP = {
-    "ADAUSDT":"PF_ADAUSD","XRPUSDT":"PF_XRPUSD","DOGEUSDT":"PF_DOGEUSD",
-    "LINKUSDT":"PF_LINKUSD","AVAXUSDT":"PF_AVAXUSD","DOTUSDT":"PF_DOTUSD",
-    "LTCUSDT":"PF_LTCUSD","BCHUSDT":"PF_BCHUSD","ATOMUSDT":"PF_ATOMUSD",
-    "NEARUSDT":"PF_NEARUSD","FILUSDT":"PF_FILUSD","APTUSDT":"PF_APTUSD",
-    "ARBUSDT":"PF_ARBUSD","OPUSDT":"PF_OPUSD","INJUSDT":"PF_INJUSD",
-    "SUIUSDT":"PF_SUIUSD","SEIUSDT":"PF_SEIUSD","TIAUSDT":"PF_TIAUSD",
-    "JTOUSDT":"PF_JTOUSD","ETCUSDT":"PF_ETCUSD"
+COINBASE_SYMBOL_MAP = {
+    "ADAUSDT":"ADA-USD","XRPUSDT":"XRP-USD","DOGEUSDT":"DOGE-USD",
+    "LINKUSDT":"LINK-USD","AVAXUSDT":"AVAX-USD","DOTUSDT":"DOT-USD",
+    "LTCUSDT":"LTC-USD","BCHUSDT":"BCH-USD","ATOMUSDT":"ATOM-USD",
+    "NEARUSDT":"NEAR-USD","FILUSDT":"FIL-USD","APTUSDT":"APT-USD",
+    "ARBUSDT":"ARB-USD","OPUSDT":"OP-USD","INJUSDT":"INJ-USD",
+    "SUIUSDT":"SUI-USD","SEIUSDT":"SEI-USD","TIAUSDT":"TIA-USD",
+    "JTOUSDT":"JTO-USD","ETCUSDT":"ETC-USD"
 }
-KRAKEN_FUTURES_CHARTS_URL="https://futures.kraken.com/api/charts/v1/trade"
+COINBASE_CANDLES_URL="https://api.exchange.coinbase.com/products/{product_id}/candles"
 STARTING_CAPITAL_RS=100.0
-STATE_VERSION="kraken-futures-usd-100-v5"
+STATE_VERSION="coinbase-usd-paper-100-v6"
 POSITION_PCT=0.10
 MAX_OPEN_POSITIONS=20
 EMA_FAST=9; EMA_SLOW=20; VOLUME_LOOKBACK=20; VOLUME_MULTIPLIER=1.20
@@ -51,33 +51,36 @@ def ema(vals,p):
     return out
 
 def fetch_klines(symbol,limit=120):
-    market=KRAKEN_SYMBOL_MAP.get(symbol)
-    if not market:
-        raise RuntimeError("No Kraken mapping for "+symbol)
-    url=KRAKEN_FUTURES_CHARTS_URL+"/"+market+"/1m?"+urlencode({"count":limit})
-    req=Request(url,headers={"User-Agent":"Mozilla/5.0 crypto-paper-bot","Accept":"application/json"})
+    product_id=COINBASE_SYMBOL_MAP.get(symbol)
+    if not product_id:
+        raise RuntimeError("No Coinbase mapping for "+symbol)
+    url=COINBASE_CANDLES_URL.format(product_id=product_id)+"?"+urlencode({"granularity":60})
+    req=Request(url,headers={
+        "User-Agent":"Mozilla/5.0 crypto-paper-bot",
+        "Accept":"application/json"
+    })
     with urlopen(req,timeout=10) as r:
-        payload=json.loads(r.read().decode("utf-8"))
-    raw=payload.get("candles",[])
-    if not raw:
-        raise RuntimeError("Kraken returned no candles for "+market)
-    now_ms=int(time.time()*1000)
-    current_minute_start=(now_ms//60000)*60000
+        raw=json.loads(r.read().decode("utf-8"))
+    if not isinstance(raw,list) or not raw:
+        raise RuntimeError("Coinbase returned no candles for "+product_id)
+    now_s=int(time.time())
+    current_minute_start=(now_s//60)*60
     candles=[]
-    for k in sorted(raw,key=lambda x:int(x["time"])):
-        ot=int(k["time"])
+    # Coinbase schema: [time, low, high, open, close, volume], newest first.
+    for k in sorted(raw,key=lambda x:int(x[0])):
+        ot=int(k[0])
         if ot>=current_minute_start:
             continue
         candles.append({
-            "open_time_ms":ot,
-            "close_time_ms":ot+59999,
-            "open":float(k["open"]),
-            "high":float(k["high"]),
-            "low":float(k["low"]),
-            "close":float(k["close"]),
-            "volume":float(k.get("volume",0))
+            "open_time_ms":ot*1000,
+            "close_time_ms":ot*1000+59999,
+            "open":float(k[3]),
+            "high":float(k[2]),
+            "low":float(k[1]),
+            "close":float(k[4]),
+            "volume":float(k[5])
         })
-    return candles
+    return candles[-limit:]
 def signal_on_last_bar(cs):
     if len(cs)<25: return False
     closes=[x['close'] for x in cs]; vols=[x['volume'] for x in cs]; ef=ema(closes,9); es=ema(closes,20); last=cs[-1]
@@ -148,7 +151,7 @@ def summary_data():
     return {'symbols':len(SYMBOLS),'trades':t,'wins':w,'losses':a['losses'] or 0,'win_rate':round((w/t*100) if t else 0,2),'costs':round(a['costs'],2),'net':round(a['net'],2),'capital':round(cash,2),'open':open_n}
 
 @app.route('/health')
-def health(): return jsonify(ok=True,mode='kraken-futures-paper',symbols=len(SYMBOLS),worker_started=_worker_started,utc=datetime.now(timezone.utc).isoformat())
+def health(): return jsonify(ok=True,mode='coinbase-data-paper',symbols=len(SYMBOLS),worker_started=_worker_started,utc=datetime.now(timezone.utc).isoformat())
 @app.route('/summary')
 def summary(): return jsonify(summary_data())
 @app.route('/trades')
@@ -160,7 +163,7 @@ def reset_demo():
         c=db(); c.execute('DELETE FROM trades'); c.execute('DELETE FROM positions'); c.execute('DELETE FROM processed_bars'); c.execute("INSERT INTO state(key,value) VALUES('cash_rs',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(str(STARTING_CAPITAL_RS),)); c.execute("INSERT INTO state(key,value) VALUES('state_version',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(STATE_VERSION,)); c.commit(); c.close()
     return redirect(url_for('dashboard'))
 
-HTML='''<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="20"><style>body{font-family:Arial;background:#10131a;color:#eee;padding:14px}.g{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:9px}.c{background:#1b202b;padding:12px;border-radius:10px}.l{font-size:12px;color:#aaa}.v{font-size:21px;font-weight:700}table{width:100%;border-collapse:collapse;background:#1b202b;margin-top:12px}td,th{padding:8px;border-bottom:1px solid #333;font-size:12px}.n{background:#1b202b;padding:12px;border-radius:10px;margin:14px 0}</style><h2>Crypto Futures 1m Automatic Paper Bot</h2><p>Kraken Futures public 1m data • No API key • No real orders • 20 mapped pairs</p><div class=g>{% for k,v in cards %}<div class=c><div class=l>{{k}}</div><div class=v>{{v}}</div></div>{% endfor %}</div><div class=n><b>Strategy:</b> EMA9 &gt; EMA20, close above VWAP & EMA9, volume ≥ 1.2× 20-bar average. TP +0.30%, SL -0.20%, max hold 10 bars, 10% virtual capital/trade. Fee 0.15%/side + slippage 0.05%/side.<br><br><b>Demo only.</b> Render Free can sleep, and SQLite data may disappear after restart/redeploy.</div><h3>Open Positions</h3><table><tr><th>Pair</th><th>Entry</th><th>$ Notional</th><th>Bars</th></tr>{% for p in positions %}<tr><td>{{p.symbol}}</td><td>{{p.entry_price}}</td><td>{{'%.2f'|format(p.notional_rs)}}</td><td>{{p.bars_held}}</td></tr>{% else %}<tr><td colspan=4>None</td></tr>{% endfor %}</table><h3>Latest Trades</h3><table><tr><th>Pair</th><th>Exit</th><th>P/L</th><th>Return</th></tr>{% for t in trades %}<tr><td>{{t.symbol}}</td><td>{{t.reason}}</td><td>Rs {{'%.2f'|format(t.net_pl_rs)}}</td><td>{{'%.3f'|format(t.return_pct)}}%</td></tr>{% else %}<tr><td colspan=4>No trades yet</td></tr>{% endfor %}</table><form method=post action=/reset_demo><p><button>Reset Demo</button></p></form>'''
+HTML='''<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="20"><style>body{font-family:Arial;background:#10131a;color:#eee;padding:14px}.g{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:9px}.c{background:#1b202b;padding:12px;border-radius:10px}.l{font-size:12px;color:#aaa}.v{font-size:21px;font-weight:700}table{width:100%;border-collapse:collapse;background:#1b202b;margin-top:12px}td,th{padding:8px;border-bottom:1px solid #333;font-size:12px}.n{background:#1b202b;padding:12px;border-radius:10px;margin:14px 0}</style><h2>Crypto Futures 1m Automatic Paper Bot</h2><p>Coinbase public 1m data • No API key • No real orders • 20 pairs</p><div class=g>{% for k,v in cards %}<div class=c><div class=l>{{k}}</div><div class=v>{{v}}</div></div>{% endfor %}</div><div class=n><b>Strategy:</b> EMA9 &gt; EMA20, close above VWAP & EMA9, volume ≥ 1.2× 20-bar average. TP +0.30%, SL -0.20%, max hold 10 bars, 10% virtual capital/trade. Fee 0.15%/side + slippage 0.05%/side.<br><br><b>Demo only.</b> Render Free can sleep, and SQLite data may disappear after restart/redeploy.</div><h3>Open Positions</h3><table><tr><th>Pair</th><th>Entry</th><th>$ Notional</th><th>Bars</th></tr>{% for p in positions %}<tr><td>{{p.symbol}}</td><td>{{p.entry_price}}</td><td>{{'%.2f'|format(p.notional_rs)}}</td><td>{{p.bars_held}}</td></tr>{% else %}<tr><td colspan=4>None</td></tr>{% endfor %}</table><h3>Latest Trades</h3><table><tr><th>Pair</th><th>Exit</th><th>P/L</th><th>Return</th></tr>{% for t in trades %}<tr><td>{{t.symbol}}</td><td>{{t.reason}}</td><td>Rs {{'%.2f'|format(t.net_pl_rs)}}</td><td>{{'%.3f'|format(t.return_pct)}}%</td></tr>{% else %}<tr><td colspan=4>No trades yet</td></tr>{% endfor %}</table><form method=post action=/reset_demo><p><button>Reset Demo</button></p></form>'''
 
 @app.route('/')
 def dashboard():
