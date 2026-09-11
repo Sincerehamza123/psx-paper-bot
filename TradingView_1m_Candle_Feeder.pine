@@ -1,0 +1,22 @@
+//@version=6
+indicator("PSX 1m Candle Webhook Feeder V1", overlay=false)
+
+// Put this indicator on a PSX 1-minute chart.
+// Create ONE alert using: "Any alert() function call"
+// Webhook URL should point to your reachable bot /webhook endpoint.
+//
+// IMPORTANT: one chart/alert only sends that chart's symbol.
+// For whole-PSX live coverage, use a proper market-data feed/API or
+// a TradingView watchlist-alert solution if your plan/account supports it.
+
+isOneMinute = timeframe.isminutes and timeframe.multiplier == 1
+
+if barstate.isconfirmed and isOneMinute
+    msg = '{"symbol":"' + syminfo.ticker + '",' +
+          '"datetime":"' + str.format_time(time, "yyyy-MM-dd HH:mm:ss") + '",' +
+          '"open":' + str.tostring(open) + ',' +
+          '"high":' + str.tostring(high) + ',' +
+          '"low":' + str.tostring(low) + ',' +
+          '"close":' + str.tostring(close) + ',' +
+          '"volume":' + str.tostring(volume) + '}'
+    alert(msg, alert.freq_once_per_bar_close)
