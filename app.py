@@ -8,7 +8,8 @@ app = Flask(__name__)
 DB_PATH = os.getenv('PSX_BOT_DB', os.getenv('DATABASE_PATH', '/tmp/crypto_paper_bot.db'))
 SYMBOLS = ['ADAUSDT','XRPUSDT','DOGEUSDT','LINKUSDT','AVAXUSDT','DOTUSDT','LTCUSDT','BCHUSDT','ATOMUSDT','NEARUSDT','FILUSDT','APTUSDT','ARBUSDT','OPUSDT','INJUSDT','SUIUSDT','SEIUSDT','TIAUSDT','JTOUSDT','ETCUSDT']
 BINANCE_KLINES_URL='https://api.binance.com/api/v3/klines'
-STARTING_CAPITAL_RS=100000.0
+STARTING_CAPITAL_RS=100.0
+STATE_VERSION="futures-usd-100-v2"
 POSITION_PCT=0.10
 MAX_OPEN_POSITIONS=20
 EMA_FAST=9; EMA_SLOW=20; VOLUME_LOOKBACK=20; VOLUME_MULTIPLIER=1.20
@@ -28,8 +29,11 @@ def init_db():
         CREATE TABLE IF NOT EXISTS positions(symbol TEXT PRIMARY KEY, entry_time TEXT NOT NULL, entry_close_time_ms INTEGER NOT NULL, raw_entry_price REAL NOT NULL, entry_price REAL NOT NULL, notional_rs REAL NOT NULL, bars_held INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS trades(id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL, entry_time TEXT NOT NULL, exit_time TEXT NOT NULL, raw_entry_price REAL NOT NULL, entry_price REAL NOT NULL, raw_exit_price REAL NOT NULL, exit_price REAL NOT NULL, notional_rs REAL NOT NULL, gross_pl_rs REAL NOT NULL, commission_rs REAL NOT NULL, net_pl_rs REAL NOT NULL, return_pct REAL NOT NULL, reason TEXT NOT NULL);
         ''')
-        if c.execute("SELECT 1 FROM state WHERE key='cash_rs'").fetchone() is None:
-            c.execute("INSERT INTO state(key,value) VALUES('cash_rs',?)",(str(STARTING_CAPITAL_RS),))
+        ver=c.execute("SELECT value FROM state WHERE key='state_version'").fetchone()
+        if ver is None or ver['value'] != STATE_VERSION:
+            c.execute('DELETE FROM trades'); c.execute('DELETE FROM positions'); c.execute('DELETE FROM processed_bars')
+            c.execute("INSERT INTO state(key,value) VALUES('cash_rs',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(str(STARTING_CAPITAL_RS),))
+            c.execute("INSERT INTO state(key,value) VALUES('state_version',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(STATE_VERSION,))
         c.commit(); c.close()
 
 def ema(vals,p):
@@ -126,15 +130,15 @@ def trades():
 @app.route('/reset_demo',methods=['POST'])
 def reset_demo():
     with _db_lock:
-        c=db(); c.execute('DELETE FROM trades'); c.execute('DELETE FROM positions'); c.execute('DELETE FROM processed_bars'); c.execute("UPDATE state SET value=? WHERE key='cash_rs'",(str(STARTING_CAPITAL_RS),)); c.commit(); c.close()
+        c=db(); c.execute('DELETE FROM trades'); c.execute('DELETE FROM positions'); c.execute('DELETE FROM processed_bars'); c.execute("INSERT INTO state(key,value) VALUES('cash_rs',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(str(STARTING_CAPITAL_RS),)); c.execute("INSERT INTO state(key,value) VALUES('state_version',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(STATE_VERSION,)); c.commit(); c.close()
     return redirect(url_for('dashboard'))
 
-HTML='''<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="20"><style>body{font-family:Arial;background:#10131a;color:#eee;padding:14px}.g{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:9px}.c{background:#1b202b;padding:12px;border-radius:10px}.l{font-size:12px;color:#aaa}.v{font-size:21px;font-weight:700}table{width:100%;border-collapse:collapse;background:#1b202b;margin-top:12px}td,th{padding:8px;border-bottom:1px solid #333;font-size:12px}.n{background:#1b202b;padding:12px;border-radius:10px;margin:14px 0}</style><h2>Crypto Futures 1m Automatic Paper Bot</h2><p>Binance public data • No API key • No real orders • 20 pairs</p><div class=g>{% for k,v in cards %}<div class=c><div class=l>{{k}}</div><div class=v>{{v}}</div></div>{% endfor %}</div><div class=n><b>Strategy:</b> EMA9 &gt; EMA20, close above VWAP & EMA9, volume ≥ 1.2× 20-bar average. TP +0.30%, SL -0.20%, max hold 10 bars, 10% virtual capital/trade. Fee 0.15%/side + slippage 0.05%/side.<br><br><b>Demo only.</b> Render Free can sleep, and SQLite data may disappear after restart/redeploy.</div><h3>Open Positions</h3><table><tr><th>Pair</th><th>Entry</th><th>Rs Notional</th><th>Bars</th></tr>{% for p in positions %}<tr><td>{{p.symbol}}</td><td>{{p.entry_price}}</td><td>{{'%.2f'|format(p.notional_rs)}}</td><td>{{p.bars_held}}</td></tr>{% else %}<tr><td colspan=4>None</td></tr>{% endfor %}</table><h3>Latest Trades</h3><table><tr><th>Pair</th><th>Exit</th><th>P/L</th><th>Return</th></tr>{% for t in trades %}<tr><td>{{t.symbol}}</td><td>{{t.reason}}</td><td>Rs {{'%.2f'|format(t.net_pl_rs)}}</td><td>{{'%.3f'|format(t.return_pct)}}%</td></tr>{% else %}<tr><td colspan=4>No trades yet</td></tr>{% endfor %}</table><form method=post action=/reset_demo><p><button>Reset Demo</button></p></form>'''
+HTML='''<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="20"><style>body{font-family:Arial;background:#10131a;color:#eee;padding:14px}.g{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:9px}.c{background:#1b202b;padding:12px;border-radius:10px}.l{font-size:12px;color:#aaa}.v{font-size:21px;font-weight:700}table{width:100%;border-collapse:collapse;background:#1b202b;margin-top:12px}td,th{padding:8px;border-bottom:1px solid #333;font-size:12px}.n{background:#1b202b;padding:12px;border-radius:10px;margin:14px 0}</style><h2>Crypto Futures 1m Automatic Paper Bot</h2><p>Binance public data • No API key • No real orders • 20 pairs</p><div class=g>{% for k,v in cards %}<div class=c><div class=l>{{k}}</div><div class=v>{{v}}</div></div>{% endfor %}</div><div class=n><b>Strategy:</b> EMA9 &gt; EMA20, close above VWAP & EMA9, volume ≥ 1.2× 20-bar average. TP +0.30%, SL -0.20%, max hold 10 bars, 10% virtual capital/trade. Fee 0.15%/side + slippage 0.05%/side.<br><br><b>Demo only.</b> Render Free can sleep, and SQLite data may disappear after restart/redeploy.</div><h3>Open Positions</h3><table><tr><th>Pair</th><th>Entry</th><th>$ Notional</th><th>Bars</th></tr>{% for p in positions %}<tr><td>{{p.symbol}}</td><td>{{p.entry_price}}</td><td>{{'%.2f'|format(p.notional_rs)}}</td><td>{{p.bars_held}}</td></tr>{% else %}<tr><td colspan=4>None</td></tr>{% endfor %}</table><h3>Latest Trades</h3><table><tr><th>Pair</th><th>Exit</th><th>P/L</th><th>Return</th></tr>{% for t in trades %}<tr><td>{{t.symbol}}</td><td>{{t.reason}}</td><td>Rs {{'%.2f'|format(t.net_pl_rs)}}</td><td>{{'%.3f'|format(t.return_pct)}}%</td></tr>{% else %}<tr><td colspan=4>No trades yet</td></tr>{% endfor %}</table><form method=post action=/reset_demo><p><button>Reset Demo</button></p></form>'''
 
 @app.route('/')
 def dashboard():
     ensure_worker(); s=summary_data(); c=db(); pos=[dict(x) for x in c.execute('SELECT * FROM positions ORDER BY entry_time DESC')]; tr=[dict(x) for x in c.execute('SELECT * FROM trades ORDER BY id DESC LIMIT 50')]; c.close()
-    cards=[('Pairs',s['symbols']),('Trades',s['trades']),('Wins',s['wins']),('Losses',s['losses']),('Win Rate',str(s['win_rate'])+'%'),('Net P/L','Rs '+str(s['net'])),('Costs','Rs '+str(s['costs'])),('Capital','Rs '+str(s['capital'])),('Open',s['open'])]
+    cards=[('Pairs',s['symbols']),('Trades',s['trades']),('Wins',s['wins']),('Losses',s['losses']),('Win Rate',str(s['win_rate'])+'%'),('Net P/L','$ '+str(s['net'])),('Costs','$ '+str(s['costs'])),('Capital','$ '+str(s['capital'])),('Open',s['open'])]
     return render_template_string(HTML,cards=cards,positions=pos,trades=tr)
 
 init_db(); ensure_worker()
