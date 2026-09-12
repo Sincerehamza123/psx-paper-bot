@@ -16,15 +16,10 @@ COINBASE_CANDLES_URL='https://api.exchange.coinbase.com/products/{product_id}/ca
 STARTING_CAPITAL=100.0
 POSITION_PCT=0.10
 MAX_OPEN_POSITIONS=5
-EMA_FAST=9; EMA_MID=20; EMA_TREND=50
-RSI_PERIOD=14; RSI_MIN=52.0; RSI_MAX=68.0
-VOLUME_LOOKBACK=20; VOLUME_MULTIPLIER=1.50
-MIN_BODY_PCT=0.08
-EMA50_MIN_DISTANCE_PCT=0.015  # Close must be at least 1.5% above EMA50
-COOLDOWN_BARS=15
-TAKE_PROFIT_PCT=0.0040
-STOP_LOSS_PCT=0.0020
-MAX_HOLD_BARS=15
+CE_ATR_PERIOD=1
+CE_ATR_MULTIPLIER=2.0
+ZLSMA_PERIOD=50
+COOLDOWN_BARS=0
 COMMISSION_PCT_PER_SIDE=0.0005
 SLIPPAGE_PCT_PER_SIDE=0.0001
 POLL_SECONDS=20
@@ -47,7 +42,7 @@ class State(Base):
 class ProcessedBar(Base):
     __tablename__='processed_bars'; symbol:Mapped[str]=mapped_column(String(30),primary_key=True); close_time_ms:Mapped[int]=mapped_column(BigInteger,primary_key=True)
 class Position(Base):
-    __tablename__='positions'; symbol:Mapped[str]=mapped_column(String(30),primary_key=True); entry_time:Mapped[str]=mapped_column(String(80)); entry_close_time_ms:Mapped[int]=mapped_column(BigInteger); raw_entry_price:Mapped[float]=mapped_column(Float); entry_price:Mapped[float]=mapped_column(Float); notional:Mapped[float]=mapped_column(Float); bars_held:Mapped[int]=mapped_column(Integer,default=0)
+    __tablename__='positions'; symbol:Mapped[str]=mapped_column(String(30),primary_key=True); side:Mapped[str]=mapped_column(String(10),default='LONG'); entry_time:Mapped[str]=mapped_column(String(80)); entry_close_time_ms:Mapped[int]=mapped_column(BigInteger); raw_entry_price:Mapped[float]=mapped_column(Float); entry_price:Mapped[float]=mapped_column(Float); notional:Mapped[float]=mapped_column(Float); bars_held:Mapped[int]=mapped_column(Integer,default=0)
 class Trade(Base):
     __tablename__='trades'; id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True); symbol:Mapped[str]=mapped_column(String(30)); entry_time:Mapped[str]=mapped_column(String(80)); exit_time:Mapped[str]=mapped_column(String(80)); raw_entry_price:Mapped[float]=mapped_column(Float); entry_price:Mapped[float]=mapped_column(Float); raw_exit_price:Mapped[float]=mapped_column(Float); exit_price:Mapped[float]=mapped_column(Float); notional:Mapped[float]=mapped_column(Float); gross_pl:Mapped[float]=mapped_column(Float); commission:Mapped[float]=mapped_column(Float); net_pl:Mapped[float]=mapped_column(Float); return_pct:Mapped[float]=mapped_column(Float); reason:Mapped[str]=mapped_column(String(20))
 class Cooldown(Base):
@@ -70,7 +65,7 @@ def set_state(key,value):
 def init_db():
     with _db_lock, SessionLocal() as s:
         if not s.get(State,'cash'): s.add(State(key='cash',value=str(STARTING_CAPITAL)))
-        if not s.get(State,'strategy_version'): s.add(State(key='strategy_version',value='v2-trend-rsi-volume-cooldown'))
+        if not s.get(State,'strategy_version'): s.add(State(key='strategy_version',value='cezlsma-v1'))
         s.commit()
 
 def current_cash(s):
@@ -84,40 +79,109 @@ def set_cash(s,amount):
     if r: r.value=str(amount)
     else: s.add(State(key='cash',value=str(amount)))
 
-def ema(vals,p):
-    if not vals: return []
-    a=2/(p+1); out=[float(vals[0])]
-    for v in vals[1:]: out.append(a*float(v)+(1-a)*out[-1])
+def _linreg_series(vals,p):
+    """TradingView-style ta.linreg(source, length, 0), O(n)."""
+    n=len(vals); out=[None]*n
+    if p<=1:
+        return [float(v) for v in vals]
+    sx=p*(p-1)/2.0
+    sx2=p*(p-1)*(2*p-1)/6.0
+    den=p*sx2-sx*sx
+    if n<p: return out
+    sy=sum(float(v) for v in vals[:p])
+    sxy=sum(i*float(vals[i]) for i in range(p))
+    def calc(sy,sxy):
+        slope=(p*sxy-sx*sy)/den
+        intercept=(sy-slope*sx)/p
+        return intercept+slope*(p-1)
+    out[p-1]=calc(sy,sxy)
+    for i in range(p,n):
+        old=float(vals[i-p]); new=float(vals[i]); old_sy=sy
+        sxy=sxy-(old_sy-old)+(p-1)*new
+        sy=old_sy-old+new
+        out[i]=calc(sy,sxy)
     return out
 
-def rsi(vals,p=14):
-    if len(vals)<p+1: return [50.0]*len(vals)
-    out=[50.0]*len(vals); gains=[]; losses=[]
-    for i in range(1,p+1):
-        d=vals[i]-vals[i-1]; gains.append(max(d,0)); losses.append(max(-d,0))
-    ag=sum(gains)/p; al=sum(losses)/p; out[p]=100.0 if al==0 else 100-100/(1+ag/al)
-    for i in range(p+1,len(vals)):
-        d=vals[i]-vals[i-1]; g=max(d,0); l=max(-d,0); ag=(ag*(p-1)+g)/p; al=(al*(p-1)+l)/p; out[i]=100.0 if al==0 else 100-100/(1+ag/al)
+def _heikin_ashi(cs):
+    out=[]; prev_open=None; prev_close=None
+    for c in cs:
+        hc=(c['open']+c['high']+c['low']+c['close'])/4.0
+        ho=(c['open']+c['close'])/2.0 if prev_open is None else (prev_open+prev_close)/2.0
+        hh=max(c['high'],ho,hc); hl=min(c['low'],ho,hc)
+        out.append({'open':ho,'high':hh,'low':hl,'close':hc})
+        prev_open,prev_close=ho,hc
     return out
+
+def _true_ranges(cs):
+    out=[]
+    for i,c in enumerate(cs):
+        if i==0: tr=c['high']-c['low']
+        else:
+            pc=cs[i-1]['close']
+            tr=max(c['high']-c['low'],abs(c['high']-pc),abs(c['low']-pc))
+        out.append(tr)
+    return out
+
+def _rma(vals,p):
+    # Pine ta.atr uses Wilder RMA. With p=1, ATR equals true range.
+    n=len(vals); out=[None]*n
+    if n<p: return out
+    seed=sum(vals[:p])/p; out[p-1]=seed; prev=seed
+    for i in range(p,n):
+        prev=(prev*(p-1)+vals[i])/p; out[i]=prev
+    return out
+
+def cezlsma_state(cs):
+    """Geraked CEZLSMA rules, applied to Heikin-Ashi candles.
+    Returns latest signal, ZLSMA-cross exit flags, and Chandelier stops.
+    """
+    if len(cs)<(ZLSMA_PERIOD*2):
+        return {'signal':None,'exit_long':False,'exit_short':False,'long_stop':None,'short_stop':None,'zlsma':None}
+    ha=_heikin_ashi(cs)
+    closes=[c['close'] for c in ha]
+    trs=_true_ranges(ha); atr=_rma(trs,CE_ATR_PERIOD)
+    n=len(ha)
+    long_stop=[None]*n; short_stop=[None]*n; direction=[1]*n
+    for i in range(n):
+        if atr[i] is None: continue
+        a=CE_ATR_MULTIPLIER*atr[i]
+        lo=max(closes[max(0,i-CE_ATR_PERIOD+1):i+1])-a
+        sh=min(closes[max(0,i-CE_ATR_PERIOD+1):i+1])+a
+        if i==0 or long_stop[i-1] is None:
+            long_stop[i]=lo; short_stop[i]=sh; direction[i]=1
+            continue
+        lprev=long_stop[i-1]; sprev=short_stop[i-1]
+        long_stop[i]=max(lo,lprev) if closes[i-1]>lprev else lo
+        short_stop[i]=min(sh,sprev) if closes[i-1]<sprev else sh
+        if closes[i]>sprev: direction[i]=1
+        elif closes[i]<lprev: direction[i]=-1
+        else: direction[i]=direction[i-1]
+
+    lsma=_linreg_series(closes,ZLSMA_PERIOD)
+    # second LSMA starts once the first LSMA has a full valid region
+    valid=[x for x in lsma if x is not None]
+    lsma2_valid=_linreg_series(valid,ZLSMA_PERIOD)
+    lsma2=[None]*n
+    first=ZLSMA_PERIOD-1
+    for j,v in enumerate(lsma2_valid):
+        if v is not None: lsma2[first+j]=v
+    z=[None]*n
+    for i in range(n):
+        if lsma[i] is not None and lsma2[i] is not None:
+            z[i]=lsma[i]+(lsma[i]-lsma2[i])
+    i=n-1
+    if i<1 or z[i] is None or z[i-1] is None:
+        return {'signal':None,'exit_long':False,'exit_short':False,'long_stop':long_stop[i],'short_stop':short_stop[i],'zlsma':z[i]}
+    buy=(direction[i]==1 and direction[i-1]==-1 and closes[i]>z[i])
+    sell=(direction[i]==-1 and direction[i-1]==1 and closes[i]<z[i])
+    crossunder=(closes[i]<z[i] and closes[i-1]>=z[i-1])
+    crossover=(closes[i]>z[i] and closes[i-1]<=z[i-1])
+    return {'signal':'LONG' if buy else ('SHORT' if sell else None),
+            'exit_long':crossunder,'exit_short':crossover,
+            'long_stop':long_stop[i],'short_stop':short_stop[i],'zlsma':z[i]}
 
 def signal_on_last_bar(cs):
-    # EMA50 Mean Reversion V3.2
-    # SHORT: price >= 1.50% above EMA50 + TWO consecutive red candles.
-    # LONG: price <= 1.50% below EMA50 + TWO consecutive green candles.
-    if len(cs) < 55:
-        return None
-    closes = [x['close'] for x in cs]
-    e50 = ema(closes, 50)
-    last, prev = cs[-1], cs[-2]
-    upper = e50[-1] * 1.015
-    lower = e50[-1] * 0.985
-    two_red = prev['close'] < prev['open'] and last['close'] < last['open']
-    two_green = prev['close'] > prev['open'] and last['close'] > last['open']
-    if last['close'] >= upper and two_red:
-        return 'SHORT'
-    if last['close'] <= lower and two_green:
-        return 'LONG'
-    return None
+    return cezlsma_state(cs)['signal']
 
 def fetch_klines(symbol,limit=180):
     pid=COINBASE_SYMBOL_MAP.get(symbol)
@@ -154,25 +218,24 @@ def close_position(s,pos,c,raw_exit,reason):
     s.add(Trade(symbol=pos.symbol,entry_time=pos.entry_time,exit_time=datetime.fromtimestamp(c['close_time_ms']/1000,tz=timezone.utc).isoformat(),raw_entry_price=pos.raw_entry_price,entry_price=entry,raw_exit_price=float(raw_exit),exit_price=exitp,notional=n,gross_pl=gross,commission=fee,net_pl=net,return_pct=(net/n)*100 if n else 0,reason=side+' '+reason)); set_cash(s,current_cash(s)+net); set_cooldown(s,pos.symbol,c['close_time_ms']); s.delete(pos)
 
 def process_symbol(symbol):
-    cs=fetch_klines(symbol); last=cs[-1] if cs else None
+    cs=fetch_klines(symbol,limit=180); last=cs[-1] if cs else None
     if not last: return
+    state=cezlsma_state(cs)
     with _db_lock, SessionLocal() as s:
         if s.get(ProcessedBar,{'symbol':symbol,'close_time_ms':last['close_time_ms']}): return
         pos=s.get(Position,symbol)
         if pos and last['close_time_ms']>pos.entry_close_time_ms:
             pos.bars_held+=1; side=getattr(pos,'side','LONG') or 'LONG'
             if side=='LONG':
-                tp=pos.entry_price*(1+TAKE_PROFIT_PCT); sl=pos.entry_price*(1-STOP_LOSS_PCT)
-                if last['low']<=sl: close_position(s,pos,last,sl,'SL')
-                elif last['high']>=tp: close_position(s,pos,last,tp,'TP')
-                elif pos.bars_held>=MAX_HOLD_BARS: close_position(s,pos,last,last['close'],'TIME')
+                stop=state.get('long_stop')
+                if stop is not None and last['low']<=stop: close_position(s,pos,last,stop,'CE-SL')
+                elif state.get('exit_long'): close_position(s,pos,last,last['close'],'ZLSMA')
             else:
-                tp=pos.entry_price*(1-TAKE_PROFIT_PCT); sl=pos.entry_price*(1+STOP_LOSS_PCT)
-                if last['high']>=sl: close_position(s,pos,last,sl,'SL')
-                elif last['low']<=tp: close_position(s,pos,last,tp,'TP')
-                elif pos.bars_held>=MAX_HOLD_BARS: close_position(s,pos,last,last['close'],'TIME')
+                stop=state.get('short_stop')
+                if stop is not None and last['high']>=stop: close_position(s,pos,last,stop,'CE-SL')
+                elif state.get('exit_short'): close_position(s,pos,last,last['close'],'ZLSMA')
         if not s.get(Position,symbol):
-            side=signal_on_last_bar(cs)
+            side=state.get('signal')
             if side: open_position(s,symbol,last,side)
         s.add(ProcessedBar(symbol=symbol,close_time_ms=last['close_time_ms'])); s.commit()
 
@@ -209,22 +272,27 @@ def fetch_historical_day(symbol,day_start,range_start,range_end):
         cur=ce+timedelta(minutes=1); time.sleep(.16)
     return [rows[k] for k in sorted(rows)]
 
-def run_backtest_30d():
+def run_backtest_15d():
     global _backtest_running
     try:
-        set_state('bt_status','running'); set_state('bt_progress','0'); set_state('bt_message','Starting EMA50 Mean-Reversion V3.2 backtest...'); set_state('bt_result','')
-        end_dt=datetime.now(timezone.utc).replace(second=0,microsecond=0); start_dt=end_dt-timedelta(days=15); capital=STARTING_CAPITAL; hist={s:[] for s in SYMBOLS}; pos={}; cooldown={}; lastc={}; unavailable=set(); st={'trades':0,'wins':0,'losses':0,'gross':0.0,'costs':0.0,'net':0.0,'tp_count':0,'sl_count':0,'time_count':0,'end_count':0,'tp_net':0.0,'sl_net':0.0,'time_net':0.0,'end_net':0.0}
+        set_state('bt_status','running'); set_state('bt_progress','0'); set_state('bt_message','Starting CEZLSMA 15-day backtest...'); set_state('bt_result','')
+        end_dt=datetime.now(timezone.utc).replace(second=0,microsecond=0); start_dt=end_dt-timedelta(days=15)
+        capital=STARTING_CAPITAL; hist={s:[] for s in SYMBOLS}; pos={}; lastc={}; unavailable=set()
+        st={'trades':0,'wins':0,'losses':0,'gross':0.0,'costs':0.0,'net':0.0,'ce_count':0,'zlsma_count':0,'end_count':0,'ce_net':0.0,'zlsma_net':0.0,'end_net':0.0}
         def close_bt(sym,c,raw,reason):
             nonlocal capital
-            p=pos.pop(sym); entry=p['entry']; n=p['notional']; side=p.get('side','LONG'); exitp=float(raw)*(1-SLIPPAGE_PCT_PER_SIDE) if side=='LONG' else float(raw)*(1+SLIPPAGE_PCT_PER_SIDE); gr=(exitp-entry)/entry if side=='LONG' else (entry-exitp)/entry; gross=n*gr; fee=n*COMMISSION_PCT_PER_SIDE+max(0,n*(1+gr))*COMMISSION_PCT_PER_SIDE; net=gross-fee; capital+=net; cooldown[sym]=c['close_time_ms']+COOLDOWN_BARS*60000; st['trades']+=1; st['gross']+=gross; st['costs']+=fee; st['net']+=net
-            if reason=='TP': st['tp_count']+=1; st['tp_net']+=net
-            elif reason=='SL': st['sl_count']+=1; st['sl_net']+=net
-            elif reason=='TIME': st['time_count']+=1; st['time_net']+=net
+            p=pos.pop(sym); entry=p['entry']; n=p['notional']; side=p.get('side','LONG')
+            exitp=float(raw)*(1-SLIPPAGE_PCT_PER_SIDE) if side=='LONG' else float(raw)*(1+SLIPPAGE_PCT_PER_SIDE)
+            gr=(exitp-entry)/entry if side=='LONG' else (entry-exitp)/entry
+            gross=n*gr; fee=n*COMMISSION_PCT_PER_SIDE+max(0,n*(1+gr))*COMMISSION_PCT_PER_SIDE; net=gross-fee
+            capital+=net; st['trades']+=1; st['gross']+=gross; st['costs']+=fee; st['net']+=net
+            if reason=='CE-SL': st['ce_count']+=1; st['ce_net']+=net
+            elif reason=='ZLSMA': st['zlsma_count']+=1; st['zlsma_net']+=net
             else: st['end_count']+=1; st['end_net']+=net
             if net>0: st['wins']+=1
             else: st['losses']+=1
         fd=start_dt.replace(hour=0,minute=0,second=0,microsecond=0)
-        for d in range(31):
+        for d in range(16):
             ds=fd+timedelta(days=d)
             if ds>=end_dt: break
             ev=[]
@@ -237,29 +305,31 @@ def run_backtest_30d():
             for _,sym,c in ev:
                 lastc[sym]=c; h=hist[sym]; h.append(c)
                 if len(h)>180: del h[:-180]
+                if len(h)<(ZLSMA_PERIOD*2): continue
+                state=cezlsma_state(h)
                 p=pos.get(sym)
                 if p and c['close_time_ms']>p['t']:
-                    p['bars']+=1; side=p.get('side','LONG')
+                    side=p.get('side','LONG')
                     if side=='LONG':
-                        tp=p['entry']*(1+TAKE_PROFIT_PCT); sl=p['entry']*(1-STOP_LOSS_PCT)
-                        if c['low']<=sl: close_bt(sym,c,sl,'SL')
-                        elif c['high']>=tp: close_bt(sym,c,tp,'TP')
-                        elif p['bars']>=MAX_HOLD_BARS: close_bt(sym,c,c['close'],'TIME')
+                        stop=state.get('long_stop')
+                        if stop is not None and c['low']<=stop: close_bt(sym,c,stop,'CE-SL')
+                        elif state.get('exit_long'): close_bt(sym,c,c['close'],'ZLSMA')
                     else:
-                        tp=p['entry']*(1-TAKE_PROFIT_PCT); sl=p['entry']*(1+STOP_LOSS_PCT)
-                        if c['high']>=sl: close_bt(sym,c,sl,'SL')
-                        elif c['low']<=tp: close_bt(sym,c,tp,'TP')
-                        elif p['bars']>=MAX_HOLD_BARS: close_bt(sym,c,c['close'],'TIME')
-                if sym not in pos and len(pos)<MAX_OPEN_POSITIONS and len(h)>=55 and c['close_time_ms']>cooldown.get(sym,0):
-                    side=signal_on_last_bar(h)
+                        stop=state.get('short_stop')
+                        if stop is not None and c['high']>=stop: close_bt(sym,c,stop,'CE-SL')
+                        elif state.get('exit_short'): close_bt(sym,c,c['close'],'ZLSMA')
+                if sym not in pos and len(pos)<MAX_OPEN_POSITIONS:
+                    side=state.get('signal')
                     if side:
                         entry=c['close']*(1+SLIPPAGE_PCT_PER_SIDE) if side=='LONG' else c['close']*(1-SLIPPAGE_PCT_PER_SIDE)
-                        pos[sym]={'t':c['close_time_ms'],'entry':entry,'notional':capital*POSITION_PCT,'bars':0,'side':side}
-            pct=min(99,int(((ds-start_dt).total_seconds()/(end_dt-start_dt).total_seconds())*100)+3); set_state('bt_progress',pct); set_state('bt_message',f"EMA50 V3 through {ds.date()} • trades {st['trades']} • capital ${capital:.2f}")
+                        pos[sym]={'t':c['close_time_ms'],'entry':entry,'notional':capital*POSITION_PCT,'side':side}
+            pct=min(99,int(((ds-start_dt).total_seconds()/(end_dt-start_dt).total_seconds())*100)+3)
+            set_state('bt_progress',pct); set_state('bt_message',f"CEZLSMA through {ds.date()} • trades {st['trades']} • capital ${capital:.2f}")
         for sym in list(pos):
             if sym in lastc: close_bt(sym,lastc[sym],lastc[sym]['close'],'END')
-        t=st['trades']; w=st['wins']; result={'strategy':'EMA50 Mean Reversion ±1.50% + 2 reversal candles','days':30,'pairs_requested':len(SYMBOLS),'pairs_used':len(SYMBOLS)-len(unavailable),'trades':t,'wins':w,'losses':st['losses'],'win_rate':round((w/t*100) if t else 0,2),'gross_pl':round(st['gross'],4),'costs':round(st['costs'],4),'net_pl':round(st['net'],4),'starting_capital':STARTING_CAPITAL,'final_capital':round(capital,4),'return_pct':round((capital/STARTING_CAPITAL-1)*100,3),'tp_count':st['tp_count'],'sl_count':st['sl_count'],'time_count':st['time_count'],'tp_net':round(st['tp_net'],4),'sl_net':round(st['sl_net'],4),'time_net':round(st['time_net'],4),'tp_pct':round((st['tp_count']/t*100) if t else 0,2),'sl_pct':round((st['sl_count']/t*100) if t else 0,2),'time_pct':round((st['time_count']/t*100) if t else 0,2)}
-        set_state('bt_result',json.dumps(result)); set_state('bt_progress','100'); set_state('bt_message','EMA50 Mean-Reversion V3.2 15-day backtest completed.'); set_state('bt_status','completed')
+        tr=st['trades']; w=st['wins']
+        result={'strategy':'CEZLSMA — Chandelier Exit + ZLSMA (Heikin Ashi)','days':15,'pairs_requested':len(SYMBOLS),'pairs_used':len(SYMBOLS)-len(unavailable),'trades':tr,'wins':w,'losses':st['losses'],'win_rate':round((w/tr*100) if tr else 0,2),'gross_pl':round(st['gross'],4),'costs':round(st['costs'],4),'net_pl':round(st['net'],4),'starting_capital':STARTING_CAPITAL,'final_capital':round(capital,4),'return_pct':round((capital/STARTING_CAPITAL-1)*100,3),'ce_count':st['ce_count'],'zlsma_count':st['zlsma_count'],'ce_net':round(st['ce_net'],4),'zlsma_net':round(st['zlsma_net'],4),'ce_pct':round((st['ce_count']/tr*100) if tr else 0,2),'zlsma_pct':round((st['zlsma_count']/tr*100) if tr else 0,2)}
+        set_state('bt_result',json.dumps(result)); set_state('bt_progress','100'); set_state('bt_message','CEZLSMA 15-day backtest completed.'); set_state('bt_status','completed')
     except Exception as e:
         set_state('bt_status','error'); set_state('bt_message',type(e).__name__+': '+str(e)); print('[backtest] fatal',e,flush=True)
     finally:
@@ -288,10 +358,10 @@ def start_backtest():
     global _backtest_running
     with _backtest_lock:
         if _backtest_running: return redirect(url_for('dashboard'))
-        _backtest_running=True; threading.Thread(target=run_backtest_30d,daemon=True).start()
+        _backtest_running=True; threading.Thread(target=run_backtest_15d,daemon=True).start()
     return redirect(url_for('dashboard'))
 
-HTML='''<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="20"><style>body{font-family:Arial;background:#10131a;color:#eee;padding:14px;max-width:1100px;margin:auto}.g{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px}.c,.n,.bt{background:#1b202b;padding:13px;border-radius:12px}.l{font-size:12px;color:#aaa}.v{font-size:22px;font-weight:700}table{width:100%;border-collapse:collapse;background:#1b202b;margin-top:12px}td,th{padding:8px;border-bottom:1px solid #333;font-size:12px;text-align:left}.n,.bt{margin:14px 0}.ok{color:#78d98b}.bad{color:#ff9c9c}button{background:#fff;color:#111;border:0;border-radius:8px;padding:10px 14px;font-weight:700}.p{height:10px;background:#303746;border-radius:8px;overflow:hidden;margin:8px 0}.pb{height:100%;background:#ddd}.small{color:#aaa;font-size:12px}</style><h2>Crypto 1m Automatic Paper Bot — EMA50 Mean Reversion V3.2</h2><p>Coinbase public 1m data • No API key • No real orders • 20 pairs</p><div class=n><b>Storage:</b> {% if persistent %}<span class=ok>Persistent database connected ✅</span>{% else %}<span class=bad>Temporary SQLite ⚠️ — restart/redeploy can erase history</span>{% endif %}</div><div class=g>{% for k,v in cards %}<div class=c><div class=l>{{k}}</div><div class=v>{{v}}</div></div>{% endfor %}</div><div class=n><b>Strategy:</b> EMA50 Mean Reversion V3.2.<br><b>SHORT:</b> price ≥1.50% above EMA50 + TWO consecutive RED 1m candles.<br><b>LONG:</b> price ≥1.50% below EMA50 + TWO consecutive GREEN 1m candles.<br><b>No entry indicators:</b> EMA9, VWAP, RSI and volume removed.<br><b>Exit:</b> TP +0.40%, SL -0.20%, max hold 15 bars.<br><b>Risk:</b> max 5 open positions, 10% capital/trade.<br><b>Costs:</b> fee 0.05%/side + slippage 0.01%/side.</div><div class=bt><h3>15-Day Backtest — EMA50 V3.2</h3>{% if bt_status=='running' %}<b>Running: {{bt_progress}}%</b><div class=p><div class=pb style="width:{{bt_progress}}%"></div></div><div class=small>{{bt_message}}</div>{% else %}<form method=post action=/backtest/start><button>Run 15-Day Backtest</button></form>{% if bt_message %}<p class=small>{{bt_message}}</p>{% endif %}{% endif %}{% if bt_result %}<div class=g><div class=c><div class=l>BT Trades</div><div class=v>{{bt_result.trades}}</div></div><div class=c><div class=l>BT Win Rate</div><div class=v>{{bt_result.win_rate}}%</div></div><div class=c><div class=l>BT Net P/L</div><div class=v>$ {{bt_result.net_pl}}</div></div><div class=c><div class=l>BT Final Capital</div><div class=v>$ {{bt_result.final_capital}}</div></div><div class=c><div class=l>BT Return</div><div class=v>{{bt_result.return_pct}}%</div></div></div><h4>Exit Diagnostics</h4><table><tr><th>Exit</th><th>Count</th><th>% Trades</th><th>Net P/L</th></tr><tr><td>TP</td><td>{{bt_result.tp_count}}</td><td>{{bt_result.tp_pct}}%</td><td>$ {{bt_result.tp_net}}</td></tr><tr><td>SL</td><td>{{bt_result.sl_count}}</td><td>{{bt_result.sl_pct}}%</td><td>$ {{bt_result.sl_net}}</td></tr><tr><td>TIME</td><td>{{bt_result.time_count}}</td><td>{{bt_result.time_pct}}%</td><td>$ {{bt_result.time_net}}</td></tr></table>{% endif %}</div><h3>Open Positions</h3><table><tr><th>Pair</th><th>Entry</th><th>$ Notional</th><th>Bars</th></tr>{% for p in positions %}<tr><td>{{p.symbol}}</td><td>{{'%.8f'|format(p.entry_price)}}</td><td>{{'%.2f'|format(p.notional)}}</td><td>{{p.bars_held}}</td></tr>{% else %}<tr><td colspan=4>None</td></tr>{% endfor %}</table><h3>Latest Trades</h3><table><tr><th>Pair</th><th>Exit</th><th>P/L</th><th>Return</th></tr>{% for t in trades %}<tr><td>{{t.symbol}}</td><td>{{t.reason}}</td><td>$ {{'%.4f'|format(t.net_pl)}}</td><td>{{'%.3f'|format(t.return_pct)}}%</td></tr>{% else %}<tr><td colspan=4>No trades yet</td></tr>{% endfor %}</table><form method=post action=/reset_demo><p><button>Reset Live Demo</button></p></form>'''
+HTML='''<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="20"><style>body{font-family:Arial;background:#10131a;color:#eee;padding:14px;max-width:1100px;margin:auto}.g{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px}.c,.n,.bt{background:#1b202b;padding:13px;border-radius:12px}.l{font-size:12px;color:#aaa}.v{font-size:22px;font-weight:700}table{width:100%;border-collapse:collapse;background:#1b202b;margin-top:12px}td,th{padding:8px;border-bottom:1px solid #333;font-size:12px;text-align:left}.n,.bt{margin:14px 0}.ok{color:#78d98b}.bad{color:#ff9c9c}button{background:#fff;color:#111;border:0;border-radius:8px;padding:10px 14px;font-weight:700}.p{height:10px;background:#303746;border-radius:8px;overflow:hidden;margin:8px 0}.pb{height:100%;background:#ddd}.small{color:#aaa;font-size:12px}</style><h2>Crypto 1m Automatic Paper Bot — CEZLSMA</h2><p>Coinbase public 1m data • No API key • No real orders • 20 pairs</p><div class=n><b>Storage:</b> {% if persistent %}<span class=ok>Persistent database connected ✅</span>{% else %}<span class=bad>Temporary SQLite ⚠️ — restart/redeploy can erase history</span>{% endif %}</div><div class=g>{% for k,v in cards %}<div class=c><div class=l>{{k}}</div><div class=v>{{v}}</div></div>{% endfor %}</div><div class=n><b>Strategy:</b> CEZLSMA (Chandelier Exit + ZLSMA), using Heikin-Ashi candles for signals.<br><b>Chandelier Exit:</b> ATR period 1, multiplier 2.<br><b>ZLSMA:</b> period 50.<br><b>LONG:</b> CE flips to BUY and HA close is above ZLSMA.<br><b>SHORT:</b> CE flips to SELL and HA close is below ZLSMA.<br><b>Exit:</b> Chandelier stop or opposite ZLSMA cross. No fixed TP / time exit.<br><b>Risk:</b> max 5 open positions, 10% capital/trade.<br><b>Costs:</b> fee 0.05%/side + slippage 0.01%/side.</div><div class=bt><h3>15-Day Backtest — CEZLSMA</h3>{% if bt_status=='running' %}<b>Running: {{bt_progress}}%</b><div class=p><div class=pb style="width:{{bt_progress}}%"></div></div><div class=small>{{bt_message}}</div>{% else %}<form method=post action=/backtest/start><button>Run 15-Day Backtest</button></form>{% if bt_message %}<p class=small>{{bt_message}}</p>{% endif %}{% endif %}{% if bt_result %}<div class=g><div class=c><div class=l>BT Trades</div><div class=v>{{bt_result.trades}}</div></div><div class=c><div class=l>BT Win Rate</div><div class=v>{{bt_result.win_rate}}%</div></div><div class=c><div class=l>BT Net P/L</div><div class=v>$ {{bt_result.net_pl}}</div></div><div class=c><div class=l>BT Final Capital</div><div class=v>$ {{bt_result.final_capital}}</div></div><div class=c><div class=l>BT Return</div><div class=v>{{bt_result.return_pct}}%</div></div></div><h4>Exit Diagnostics</h4><table><tr><th>Exit</th><th>Count</th><th>% Trades</th><th>Net P/L</th></tr><tr><td>CE Stop</td><td>{{bt_result.ce_count}}</td><td>{{bt_result.ce_pct}}%</td><td>$ {{bt_result.ce_net}}</td></tr><tr><td>ZLSMA Cross</td><td>{{bt_result.zlsma_count}}</td><td>{{bt_result.zlsma_pct}}%</td><td>$ {{bt_result.zlsma_net}}</td></tr></table>{% endif %}</div><h3>Open Positions</h3><table><tr><th>Pair</th><th>Side</th><th>Entry</th><th>$ Notional</th><th>Bars</th></tr>{% for p in positions %}<tr><td>{{p.symbol}}</td><td>{{p.side}}</td><td>{{'%.8f'|format(p.entry_price)}}</td><td>{{'%.2f'|format(p.notional)}}</td><td>{{p.bars_held}}</td></tr>{% else %}<tr><td colspan=5>None</td></tr>{% endfor %}</table><h3>Latest Trades</h3><table><tr><th>Pair</th><th>Exit</th><th>P/L</th><th>Return</th></tr>{% for t in trades %}<tr><td>{{t.symbol}}</td><td>{{t.reason}}</td><td>$ {{'%.4f'|format(t.net_pl)}}</td><td>{{'%.3f'|format(t.return_pct)}}%</td></tr>{% else %}<tr><td colspan=4>No trades yet</td></tr>{% endfor %}</table><form method=post action=/reset_demo><p><button>Reset Live Demo</button></p></form>'''
 
 @app.route('/')
 def dashboard():
