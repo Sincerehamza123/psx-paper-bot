@@ -377,30 +377,60 @@ if __name__=='__main__': app.run(host='0.0.0.0',port=int(os.getenv('PORT','8080'
 
 @app.route("/download-backtest-data")
 def download_backtest_data():
-    """Download XRPUSDT 15-day 1-minute candles as CSV for offline strategy testing."""
+    """Download a full 15 days of XRP-USD 1-minute Coinbase candles in chunks."""
+    import requests
+    from datetime import datetime, timedelta, timezone
     try:
-        # Reuse the same Coinbase candle loader used by this bot.
-        try:
-            candles = fetch_klines("XRPUSDT", days=15)
-        except TypeError:
-            candles = fetch_klines("XRPUSDT")
+        product = "XRP-USD"
+        granularity = 60
+        end_dt = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        start_dt = end_dt - timedelta(days=15)
+
+        all_rows = {}
+        chunk_start = start_dt
+        # Coinbase candles endpoint supports limited candles/request.
+        # Use 299-minute chunks to stay safely below the limit.
+        while chunk_start < end_dt:
+            chunk_end = min(chunk_start + timedelta(minutes=299), end_dt)
+            url = f"https://api.exchange.coinbase.com/products/{product}/candles"
+            params = {
+                "granularity": granularity,
+                "start": chunk_start.isoformat(),
+                "end": chunk_end.isoformat(),
+            }
+            r = requests.get(
+                url, params=params, timeout=20,
+                headers={"User-Agent": "Mozilla/5.0"}
+            )
+            r.raise_for_status()
+            rows = r.json()
+            if not isinstance(rows, list):
+                raise RuntimeError(f"Unexpected Coinbase response: {rows}")
+            for row in rows:
+                # Coinbase format: [time, low, high, open, close, volume]
+                if isinstance(row, list) and len(row) >= 6:
+                    ts = int(row[0])
+                    all_rows[ts] = row
+            chunk_start = chunk_end + timedelta(minutes=1)
 
         output = io.StringIO()
         writer = csv.writer(output)
         writer.writerow(["timestamp", "datetime_utc", "open", "high", "low", "close", "volume"])
-        for c in candles:
-            ts = c.get("time", c.get("timestamp", c.get("ts", "")))
-            dt = c.get("datetime", c.get("date", ""))
-            writer.writerow([
-                ts, dt,
-                c.get("open", ""), c.get("high", ""), c.get("low", ""),
-                c.get("close", ""), c.get("volume", "")
-            ])
+        for ts in sorted(all_rows):
+            row = all_rows[ts]
+            dt = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+            writer.writerow([ts, dt, row[3], row[2], row[1], row[4], row[5]])
+
         data = output.getvalue()
+        count = len(all_rows)
         return Response(
             data,
             mimetype="text/csv",
-            headers={"Content-Disposition": "attachment; filename=XRPUSDT_15day_1m.csv"}
+            headers={
+                "Content-Disposition": "attachment; filename=XRPUSDT_15day_1m.csv",
+                "X-Candle-Count": str(count),
+            },
         )
     except Exception as e:
         return Response("CSV export error: " + str(e), status=500, mimetype="text/plain")
+
