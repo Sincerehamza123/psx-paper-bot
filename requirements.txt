@@ -1,2 +1,4 @@
 flask>=3.0
 gunicorn>=22.0
+SQLAlchemy>=2.0
+psycopg[binary]>=3.2
