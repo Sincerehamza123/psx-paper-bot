@@ -3,6 +3,7 @@ import json
 import os
 import threading
 import time
+import zipfile
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -11,12 +12,16 @@ from flask import Flask, Response, jsonify, send_file
 
 app = Flask(__name__)
 
-PRODUCT_ID = "DOGE-USD"
+PAIRS = {
+    "BTCUSDT": "BTC-USD",
+    "ETHUSDT": "ETH-USD",
+}
 DAYS = 60
 GRANULARITY = 60
 CHUNK_MINUTES = 299
 
-CSV_PATH = "/tmp/DOGEUSDT_60day_1m.csv"
+BASE_DIR = "/tmp/crypto_export"
+os.makedirs(BASE_DIR, exist_ok=True)
 
 state_lock = threading.Lock()
 worker_thread = None
@@ -24,23 +29,23 @@ state = {
     "status": "idle",
     "progress": 0,
     "message": "Ready",
-    "rows": 0,
+    "rows": {},
     "error": None,
 }
 
-def fetch_chunk(start_dt, end_dt, retries=4):
+def fetch_chunk(product_id, start_dt, end_dt, retries=4):
     params = {
         "granularity": GRANULARITY,
         "start": start_dt.isoformat().replace("+00:00", "Z"),
         "end": end_dt.isoformat().replace("+00:00", "Z"),
     }
-    url = f"https://api.exchange.coinbase.com/products/{PRODUCT_ID}/candles?" + urlencode(params)
+    url = f"https://api.exchange.coinbase.com/products/{product_id}/candles?" + urlencode(params)
     last_error = None
 
     for attempt in range(retries):
         try:
             req = Request(url, headers={
-                "User-Agent": "Mozilla/5.0 DOGE-CSV-Exporter",
+                "User-Agent": "Mozilla/5.0 BTC-ETH-CSV-Exporter",
                 "Accept": "application/json",
             })
             with urlopen(req, timeout=25) as r:
@@ -63,55 +68,72 @@ def fetch_chunk(start_dt, end_dt, retries=4):
 
     raise RuntimeError(str(last_error))
 
-def build_csv():
+def build_one(symbol, product_id, base_start, base_end, pair_index, total_pairs):
+    chunks = []
+    cur = base_start
+    while cur < base_end:
+        chunk_end = min(cur + timedelta(minutes=CHUNK_MINUTES), base_end)
+        chunks.append((cur, chunk_end))
+        cur = chunk_end + timedelta(minutes=1)
+
+    all_rows = {}
+    total_chunks = len(chunks)
+
+    for i, (a, b) in enumerate(chunks, start=1):
+        part = fetch_chunk(product_id, a, b)
+        all_rows.update(part)
+
+        overall = int((((pair_index - 1) + (i / total_chunks)) / total_pairs) * 100)
+        with state_lock:
+            state["progress"] = overall
+            state["rows"][symbol] = len(all_rows)
+            state["message"] = f"{symbol}: fetching... {i}/{total_chunks}"
+
+        time.sleep(0.12)
+
+    path = os.path.join(BASE_DIR, f"{symbol}_60day_1m.csv")
+    with open(path + ".part", "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["timestamp", "datetime_utc", "open", "high", "low", "close", "volume"])
+        for ts in sorted(all_rows):
+            w.writerow(all_rows[ts])
+
+    os.replace(path + ".part", path)
+    return path, len(all_rows)
+
+def build_all():
     try:
         with state_lock:
             state.update({
                 "status": "running",
                 "progress": 0,
-                "message": "Preparing 60-day DOGE data...",
-                "rows": 0,
+                "message": "Starting BTC + ETH export...",
+                "rows": {},
                 "error": None,
             })
 
         end_dt = datetime.now(timezone.utc).replace(second=0, microsecond=0)
         start_dt = end_dt - timedelta(days=DAYS)
 
-        chunks = []
-        cur = start_dt
-        while cur < end_dt:
-            chunk_end = min(cur + timedelta(minutes=CHUNK_MINUTES), end_dt)
-            chunks.append((cur, chunk_end))
-            cur = chunk_end + timedelta(minutes=1)
+        generated = []
+        items = list(PAIRS.items())
 
-        all_rows = {}
-        total = len(chunks)
-
-        for i, (a, b) in enumerate(chunks, start=1):
-            part = fetch_chunk(a, b)
-            all_rows.update(part)
-
+        for idx, (symbol, product_id) in enumerate(items, start=1):
+            path, nrows = build_one(symbol, product_id, start_dt, end_dt, idx, len(items))
+            generated.append(path)
             with state_lock:
-                state["progress"] = int(i * 100 / total)
-                state["rows"] = len(all_rows)
-                state["message"] = f"Fetching... {state['progress']}%"
+                state["rows"][symbol] = nrows
 
-            time.sleep(0.12)
-
-        with open(CSV_PATH + ".part", "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(["timestamp", "datetime_utc", "open", "high", "low", "close", "volume"])
-            for ts in sorted(all_rows):
-                w.writerow(all_rows[ts])
-
-        os.replace(CSV_PATH + ".part", CSV_PATH)
+        zip_path = os.path.join(BASE_DIR, "BTC_ETH_60day_1m.zip")
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+            for p in generated:
+                z.write(p, arcname=os.path.basename(p))
 
         with state_lock:
             state.update({
                 "status": "ready",
                 "progress": 100,
-                "message": "CSV ready — tap Download CSV",
-                "rows": len(all_rows),
+                "message": "BTC + ETH files ready",
                 "error": None,
             })
 
@@ -129,12 +151,12 @@ def home():
 <html>
 <head>
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>DOGE 60-Day CSV Exporter</title>
+<title>BTC + ETH 60-Day CSV Exporter</title>
 <style>
 body{font-family:Arial,sans-serif;background:#f5f5f5;padding:20px}
-.card{max-width:650px;margin:auto;background:white;padding:20px;border-radius:14px}
-button,a{display:inline-block;padding:12px 16px;margin-top:10px;border-radius:9px;border:0;text-decoration:none;font-size:16px}
-button{background:#111;color:#fff}.download{background:#1976d2;color:#fff}
+.card{max-width:700px;margin:auto;background:#fff;padding:20px;border-radius:14px}
+button,a{display:inline-block;padding:12px 16px;margin:8px 6px 0 0;border-radius:9px;border:0;text-decoration:none;font-size:16px}
+button{background:#111;color:white}.download{background:#1976d2;color:#fff}
 .bar{height:18px;background:#ddd;border-radius:20px;overflow:hidden;margin-top:16px}
 .fill{height:100%;width:0;background:#1976d2}
 small{display:block;margin-top:10px;color:#555}
@@ -142,14 +164,22 @@ small{display:block;margin-top:10px;color:#555}
 </head>
 <body>
 <div class="card">
-<h2>DOGEUSDT 60-Day 1-Minute CSV Exporter</h2>
-<p>This version prepares the file in the background to avoid browser timeout.</p>
-<button onclick="startJob()">Prepare 60-Day CSV</button>
-<a id="download" class="download" href="/download" style="display:none">Download CSV</a>
+<h2>BTC + ETH 60-Day 1-Minute CSV Exporter</h2>
+<p>Ek hi click mein BTC aur ETH dono 60-day 1-minute CSV prepare hongi.</p>
+
+<button onclick="startJob()">Prepare BTC + ETH</button>
+
+<div id="downloads" style="display:none">
+  <a class="download" href="/download/btc">Download BTC CSV</a>
+  <a class="download" href="/download/eth">Download ETH CSV</a>
+  <a class="download" href="/download/zip">Download Both ZIP</a>
+</div>
+
 <div class="bar"><div id="fill" class="fill"></div></div>
 <p id="status">Ready</p>
 <small id="details"></small>
 </div>
+
 <script>
 async function startJob(){
   await fetch('/start',{method:'POST'});
@@ -161,8 +191,12 @@ async function poll(){
     let j=await r.json();
     document.getElementById('fill').style.width=(j.progress||0)+'%';
     document.getElementById('status').textContent=j.message||j.status;
-    document.getElementById('details').textContent='Rows: '+(j.rows||0)+(j.error?' | '+j.error:'');
-    document.getElementById('download').style.display=j.status==='ready'?'inline-block':'none';
+    let rows=j.rows||{};
+    document.getElementById('details').textContent=
+      'BTC rows: '+(rows.BTCUSDT||0)+' | ETH rows: '+(rows.ETHUSDT||0)+
+      (j.error?' | '+j.error:'');
+    document.getElementById('downloads').style.display=
+      j.status==='ready'?'block':'none';
     if(j.status==='running') setTimeout(poll,1500);
   }catch(e){setTimeout(poll,2500)}
 }
@@ -177,7 +211,8 @@ def start():
     with state_lock:
         if state["status"] == "running":
             return jsonify(state)
-    worker_thread = threading.Thread(target=build_csv, daemon=True)
+
+    worker_thread = threading.Thread(target=build_all, daemon=True)
     worker_thread.start()
     return jsonify({"ok": True})
 
@@ -185,17 +220,26 @@ def start():
 def status():
     return jsonify(state)
 
-@app.get("/download")
-def download():
-    if not os.path.exists(CSV_PATH):
-        return Response("CSV not ready yet.", status=404)
-    return send_file(
-        CSV_PATH,
-        as_attachment=True,
-        download_name="DOGEUSDT_60day_1m.csv",
-        mimetype="text/csv",
-        max_age=0,
-    )
+@app.get("/download/btc")
+def download_btc():
+    path = os.path.join(BASE_DIR, "BTCUSDT_60day_1m.csv")
+    if not os.path.exists(path):
+        return Response("BTC CSV not ready yet.", status=404)
+    return send_file(path, as_attachment=True, download_name="BTCUSDT_60day_1m.csv", mimetype="text/csv", max_age=0)
+
+@app.get("/download/eth")
+def download_eth():
+    path = os.path.join(BASE_DIR, "ETHUSDT_60day_1m.csv")
+    if not os.path.exists(path):
+        return Response("ETH CSV not ready yet.", status=404)
+    return send_file(path, as_attachment=True, download_name="ETHUSDT_60day_1m.csv", mimetype="text/csv", max_age=0)
+
+@app.get("/download/zip")
+def download_zip():
+    path = os.path.join(BASE_DIR, "BTC_ETH_60day_1m.zip")
+    if not os.path.exists(path):
+        return Response("ZIP not ready yet.", status=404)
+    return send_file(path, as_attachment=True, download_name="BTC_ETH_60day_1m.zip", mimetype="application/zip", max_age=0)
 
 @app.get("/health")
 def health():
