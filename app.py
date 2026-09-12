@@ -245,10 +245,10 @@ def fetch_historical_day(symbol,day_start,range_start,range_end):
         cur=ce+timedelta(minutes=1); time.sleep(.16)
     return [rows[k] for k in sorted(rows)]
 
-def run_backtest_15d():
+def run_backtest_60d():
     global _backtest_running
     try:
-        set_state('bt_status','running'); set_state('bt_progress','0'); set_state('bt_message','Starting CP1 60-day backtest...'); set_state('bt_result','')
+        set_state('bt_status','running'); set_state('bt_progress','0'); set_state('bt_message','Starting TRUE CP1 60-day backtest...'); set_state('bt_result','')
         end_dt=datetime.now(timezone.utc).replace(second=0,microsecond=0); start_dt=end_dt-timedelta(days=60)
         capital=STARTING_CAPITAL; hist={s:[] for s in SYMBOLS}; pos={}; lastc={}; unavailable=set()
         csv_seen=set()
@@ -284,7 +284,7 @@ def run_backtest_15d():
                 if c['low']<=target: close_bt(sym,c,target,'TP'); return True
             return False
         fd=start_dt.replace(hour=0,minute=0,second=0,microsecond=0)
-        for d in range(16):
+        for d in range(61):
             ds=fd+timedelta(days=d)
             if ds>=end_dt: break
             ev=[]
@@ -371,7 +371,7 @@ def start_backtest():
     global _backtest_running
     with _backtest_lock:
         if _backtest_running: return redirect(url_for('dashboard'))
-        _backtest_running=True; threading.Thread(target=run_backtest_15d,daemon=True).start()
+        _backtest_running=True; threading.Thread(target=run_backtest_60d,daemon=True).start()
     return redirect(url_for('dashboard'))
 
 HTML='''<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="20"><style>body{font-family:Arial;background:#10131a;color:#eee;padding:14px;max-width:1100px;margin:auto}.g{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px}.c,.n,.bt{background:#1b202b;padding:13px;border-radius:12px}.l{font-size:12px;color:#aaa}.v{font-size:22px;font-weight:700}table{width:100%;border-collapse:collapse;background:#1b202b;margin-top:12px}td,th{padding:8px;border-bottom:1px solid #333;font-size:12px;text-align:left}.n,.bt{margin:14px 0}.ok{color:#78d98b}.bad{color:#ff9c9c}button{background:#fff;color:#111;border:0;border-radius:8px;padding:10px 14px;font-weight:700}.p{height:10px;background:#303746;border-radius:8px;overflow:hidden;margin:8px 0}.pb{height:100%;background:#ddd}.small{color:#aaa;font-size:12px}</style><h2>Crypto 1m Automatic Paper Bot — CP1</h2><p>Coinbase public 1m data • No API key • No real orders • XRPUSDT only</p><div class=n><b>Storage:</b> {% if persistent %}<span class=ok>Persistent database connected ✅</span>{% else %}<span class=bad>Temporary SQLite ⚠️ — restart/redeploy can erase history</span>{% endif %}</div><div class=g>{% for k,v in cards %}<div class=c><div class=l>{{k}}</div><div class=v>{{v}}</div></div>{% endfor %}</div><div class=n><b>Strategy:</b> CP1 — Candlestick Pattern Strategy 1.<br><b>Original setting:</b> Reverse Signal = ON.<br><b>Bullish CP1 pattern:</b> enters SHORT on next 1m candle open.<br><b>Bearish CP1 pattern:</b> enters LONG on next 1m candle open.<br><b>Exit:</b> signal-candle high/low target with equal-distance stop (1:1 gross R:R).<br><b>Execution:</b> next-bar open; if TP and SL both touch in one candle, SL is counted first (conservative).<br><b>Risk:</b> max 5 open positions, 10% capital/trade.<br><b>Costs:</b> fee 0.05%/side + slippage 0.01%/side.</div><div class=bt><h3>60-Day Backtest — CP1</h3>{% if bt_status=='running' %}<b>Running: {{bt_progress}}%</b><div class=p><div class=pb style="width:{{bt_progress}}%"></div></div><div class=small>{{bt_message}}</div>{% else %}<form method=post action=/backtest/start><button>Run 60-Day Backtest</button></form>
