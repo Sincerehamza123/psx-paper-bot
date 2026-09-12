@@ -23,7 +23,7 @@ COOLDOWN_BARS=0
 COMMISSION_PCT_PER_SIDE=0.0005
 SLIPPAGE_PCT_PER_SIDE=0.0001
 POLL_SECONDS=20
-BACKTEST_CSV_PATH='/tmp/XRPUSDT_15day_1m.csv'
+BACKTEST_CSV_PATH='/tmp/XRPUSDT_60day_1m.csv'
 
 DATABASE_URL=os.getenv('DATABASE_URL','').strip()
 if DATABASE_URL.startswith('postgres://'):
@@ -248,8 +248,8 @@ def fetch_historical_day(symbol,day_start,range_start,range_end):
 def run_backtest_15d():
     global _backtest_running
     try:
-        set_state('bt_status','running'); set_state('bt_progress','0'); set_state('bt_message','Starting CP1 15-day backtest...'); set_state('bt_result','')
-        end_dt=datetime.now(timezone.utc).replace(second=0,microsecond=0); start_dt=end_dt-timedelta(days=15)
+        set_state('bt_status','running'); set_state('bt_progress','0'); set_state('bt_message','Starting CP1 60-day backtest...'); set_state('bt_result','')
+        end_dt=datetime.now(timezone.utc).replace(second=0,microsecond=0); start_dt=end_dt-timedelta(days=60)
         capital=STARTING_CAPITAL; hist={s:[] for s in SYMBOLS}; pos={}; lastc={}; unavailable=set()
         csv_seen=set()
         with open(BACKTEST_CSV_PATH,'w',newline='',encoding='utf-8') as _f:
@@ -342,7 +342,7 @@ def run_backtest_15d():
                 'end_pct':round((st['end_count']/tr*100) if tr else 0,2),
                 'long_count':st['long_count'],'short_count':st['short_count'],
                 'long_net':round(st['long_net'],4),'short_net':round(st['short_net'],4)}
-        set_state('bt_result',json.dumps(result)); set_state('bt_progress','100'); set_state('bt_message','CP1 15-day backtest completed.'); set_state('bt_status','completed')
+        set_state('bt_result',json.dumps(result)); set_state('bt_progress','100'); set_state('bt_message','CP1 60-day backtest completed.'); set_state('bt_status','completed')
     except Exception as e:
         set_state('bt_status','error'); set_state('bt_message',type(e).__name__+': '+str(e)); print('[backtest] fatal',e,flush=True)
     finally:
@@ -374,7 +374,7 @@ def start_backtest():
         _backtest_running=True; threading.Thread(target=run_backtest_15d,daemon=True).start()
     return redirect(url_for('dashboard'))
 
-HTML='''<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="20"><style>body{font-family:Arial;background:#10131a;color:#eee;padding:14px;max-width:1100px;margin:auto}.g{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px}.c,.n,.bt{background:#1b202b;padding:13px;border-radius:12px}.l{font-size:12px;color:#aaa}.v{font-size:22px;font-weight:700}table{width:100%;border-collapse:collapse;background:#1b202b;margin-top:12px}td,th{padding:8px;border-bottom:1px solid #333;font-size:12px;text-align:left}.n,.bt{margin:14px 0}.ok{color:#78d98b}.bad{color:#ff9c9c}button{background:#fff;color:#111;border:0;border-radius:8px;padding:10px 14px;font-weight:700}.p{height:10px;background:#303746;border-radius:8px;overflow:hidden;margin:8px 0}.pb{height:100%;background:#ddd}.small{color:#aaa;font-size:12px}</style><h2>Crypto 1m Automatic Paper Bot — CP1</h2><p>Coinbase public 1m data • No API key • No real orders • XRPUSDT only</p><div class=n><b>Storage:</b> {% if persistent %}<span class=ok>Persistent database connected ✅</span>{% else %}<span class=bad>Temporary SQLite ⚠️ — restart/redeploy can erase history</span>{% endif %}</div><div class=g>{% for k,v in cards %}<div class=c><div class=l>{{k}}</div><div class=v>{{v}}</div></div>{% endfor %}</div><div class=n><b>Strategy:</b> CP1 — Candlestick Pattern Strategy 1.<br><b>Original setting:</b> Reverse Signal = ON.<br><b>Bullish CP1 pattern:</b> enters SHORT on next 1m candle open.<br><b>Bearish CP1 pattern:</b> enters LONG on next 1m candle open.<br><b>Exit:</b> signal-candle high/low target with equal-distance stop (1:1 gross R:R).<br><b>Execution:</b> next-bar open; if TP and SL both touch in one candle, SL is counted first (conservative).<br><b>Risk:</b> max 5 open positions, 10% capital/trade.<br><b>Costs:</b> fee 0.05%/side + slippage 0.01%/side.</div><div class=bt><h3>15-Day Backtest — CP1</h3>{% if bt_status=='running' %}<b>Running: {{bt_progress}}%</b><div class=p><div class=pb style="width:{{bt_progress}}%"></div></div><div class=small>{{bt_message}}</div>{% else %}<form method=post action=/backtest/start><button>Run 15-Day Backtest</button></form>
+HTML='''<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="20"><style>body{font-family:Arial;background:#10131a;color:#eee;padding:14px;max-width:1100px;margin:auto}.g{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px}.c,.n,.bt{background:#1b202b;padding:13px;border-radius:12px}.l{font-size:12px;color:#aaa}.v{font-size:22px;font-weight:700}table{width:100%;border-collapse:collapse;background:#1b202b;margin-top:12px}td,th{padding:8px;border-bottom:1px solid #333;font-size:12px;text-align:left}.n,.bt{margin:14px 0}.ok{color:#78d98b}.bad{color:#ff9c9c}button{background:#fff;color:#111;border:0;border-radius:8px;padding:10px 14px;font-weight:700}.p{height:10px;background:#303746;border-radius:8px;overflow:hidden;margin:8px 0}.pb{height:100%;background:#ddd}.small{color:#aaa;font-size:12px}</style><h2>Crypto 1m Automatic Paper Bot — CP1</h2><p>Coinbase public 1m data • No API key • No real orders • XRPUSDT only</p><div class=n><b>Storage:</b> {% if persistent %}<span class=ok>Persistent database connected ✅</span>{% else %}<span class=bad>Temporary SQLite ⚠️ — restart/redeploy can erase history</span>{% endif %}</div><div class=g>{% for k,v in cards %}<div class=c><div class=l>{{k}}</div><div class=v>{{v}}</div></div>{% endfor %}</div><div class=n><b>Strategy:</b> CP1 — Candlestick Pattern Strategy 1.<br><b>Original setting:</b> Reverse Signal = ON.<br><b>Bullish CP1 pattern:</b> enters SHORT on next 1m candle open.<br><b>Bearish CP1 pattern:</b> enters LONG on next 1m candle open.<br><b>Exit:</b> signal-candle high/low target with equal-distance stop (1:1 gross R:R).<br><b>Execution:</b> next-bar open; if TP and SL both touch in one candle, SL is counted first (conservative).<br><b>Risk:</b> max 5 open positions, 10% capital/trade.<br><b>Costs:</b> fee 0.05%/side + slippage 0.01%/side.</div><div class=bt><h3>60-Day Backtest — CP1</h3>{% if bt_status=='running' %}<b>Running: {{bt_progress}}%</b><div class=p><div class=pb style="width:{{bt_progress}}%"></div></div><div class=small>{{bt_message}}</div>{% else %}<form method=post action=/backtest/start><button>Run 60-Day Backtest</button></form>
 <a href="/download-backtest-data" style="display:inline-block;margin-top:12px;padding:14px 20px;background:#fff;color:#111;border-radius:12px;text-decoration:none;font-weight:700;">Download Backtest CSV</a>{% if bt_message %}<p class=small>{{bt_message}}</p>{% endif %}{% endif %}{% if bt_result %}<div class=g><div class=c><div class=l>BT Trades</div><div class=v>{{bt_result.trades}}</div></div><div class=c><div class=l>BT Win Rate</div><div class=v>{{bt_result.win_rate}}%</div></div><div class=c><div class=l>BT Net P/L</div><div class=v>$ {{bt_result.net_pl}}</div></div><div class=c><div class=l>BT Final Capital</div><div class=v>$ {{bt_result.final_capital}}</div></div><div class=c><div class=l>BT Return</div><div class=v>{{bt_result.return_pct}}%</div></div></div><h4>Exit Diagnostics</h4><table><tr><th>Exit</th><th>Count</th><th>% Trades</th><th>Net P/L</th></tr><tr><td>TP</td><td>{{bt_result.tp_count}}</td><td>{{bt_result.tp_pct}}%</td><td>$ {{bt_result.tp_net}}</td></tr><tr><td>SL</td><td>{{bt_result.sl_count}}</td><td>{{bt_result.sl_pct}}%</td><td>$ {{bt_result.sl_net}}</td></tr><tr><td>END</td><td>{{bt_result.end_count}}</td><td>{{bt_result.end_pct}}%</td><td>$ {{bt_result.end_net}}</td></tr></table><h4>Side Diagnostics</h4><table><tr><th>Side</th><th>Trades</th><th>Net P/L</th></tr><tr><td>LONG</td><td>{{bt_result.long_count}}</td><td>$ {{bt_result.long_net}}</td></tr><tr><td>SHORT</td><td>{{bt_result.short_count}}</td><td>$ {{bt_result.short_net}}</td></tr></table>{% endif %}</div><h3>Open Positions</h3><table><tr><th>Pair</th><th>Side</th><th>Entry</th><th>$ Notional</th><th>Bars</th></tr>{% for p in positions %}<tr><td>{{p.symbol}}</td><td>{{p.side}}</td><td>{{'%.8f'|format(p.entry_price)}}</td><td>{{'%.2f'|format(p.notional)}}</td><td>{{p.bars_held}}</td></tr>{% else %}<tr><td colspan=5>None</td></tr>{% endfor %}</table><h3>Latest Trades</h3><table><tr><th>Pair</th><th>Exit</th><th>P/L</th><th>Return</th></tr>{% for t in trades %}<tr><td>{{t.symbol}}</td><td>{{t.reason}}</td><td>$ {{'%.4f'|format(t.net_pl)}}</td><td>{{'%.3f'|format(t.return_pct)}}%</td></tr>{% else %}<tr><td colspan=4>No trades yet</td></tr>{% endfor %}</table><form method=post action=/reset_demo><p><button>Reset Live Demo</button></p></form>'''
 
 @app.route('/')
@@ -394,7 +394,7 @@ def download_backtest_data():
     try:
         if not os.path.exists(BACKTEST_CSV_PATH):
             return Response(
-                "Pehle Run 15-Day Backtest chalayein. Phir CSV download karein.",
+                "Pehle Run 60-Day Backtest chalayein. Phir CSV download karein.",
                 status=409,
                 mimetype="text/plain"
             )
@@ -409,7 +409,7 @@ def download_backtest_data():
             BACKTEST_CSV_PATH,
             mimetype="text/csv",
             as_attachment=True,
-            download_name="XRPUSDT_15day_1m.csv"
+            download_name="XRPUSDT_60day_1m.csv"
         )
     except Exception as e:
         return Response("CSV download error: " + str(e), status=500, mimetype="text/plain")
