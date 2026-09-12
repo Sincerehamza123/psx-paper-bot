@@ -1,117 +1,206 @@
 import csv
-import io
 import json
+import os
+import threading
 import time
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from flask import Flask, Response
+from flask import Flask, Response, jsonify, send_file
 
 app = Flask(__name__)
 
-SYMBOL = "ADAUSDT"
-PRODUCT_ID = "ADA-USD"
-COINBASE_CANDLES_URL = "https://api.exchange.coinbase.com/products/{product_id}/candles"
+PRODUCT_ID = "DOGE-USD"
+DAYS = 60
+GRANULARITY = 60
+CHUNK_MINUTES = 299
 
-def fetch_chunk(start_dt, end_dt):
+CSV_PATH = "/tmp/DOGEUSDT_60day_1m.csv"
+
+state_lock = threading.Lock()
+worker_thread = None
+state = {
+    "status": "idle",
+    "progress": 0,
+    "message": "Ready",
+    "rows": 0,
+    "error": None,
+}
+
+def fetch_chunk(start_dt, end_dt, retries=4):
     params = {
-        "granularity": 60,
-        "start": start_dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
-        "end": end_dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "granularity": GRANULARITY,
+        "start": start_dt.isoformat().replace("+00:00", "Z"),
+        "end": end_dt.isoformat().replace("+00:00", "Z"),
     }
-    url = COINBASE_CANDLES_URL.format(product_id=PRODUCT_ID) + "?" + urlencode(params)
-    req = Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0 crypto-data-exporter",
-            "Accept": "application/json",
-        },
-    )
-    with urlopen(req, timeout=20) as r:
-        raw = json.loads(r.read().decode("utf-8"))
+    url = f"https://api.exchange.coinbase.com/products/{PRODUCT_ID}/candles?" + urlencode(params)
+    last_error = None
 
-    rows = {}
-    if isinstance(raw, list):
-        for k in raw:
-            ts = int(k[0])
-            rows[ts] = {
-                "timestamp": ts,
-                "datetime_utc": datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
-                "open": float(k[3]),
-                "high": float(k[2]),
-                "low": float(k[1]),
-                "close": float(k[4]),
-                "volume": float(k[5]),
-            }
-    return [rows[k] for k in sorted(rows)]
-
-def fetch_60_days():
-    end_dt = datetime.now(timezone.utc).replace(second=0, microsecond=0)
-    start_dt = end_dt - timedelta(days=60)
-
-    all_rows = {}
-    cur = start_dt
-
-    # Coinbase allows max ~300 one-minute candles per request.
-    while cur < end_dt:
-        chunk_end = min(cur + timedelta(minutes=299), end_dt)
+    for attempt in range(retries):
         try:
-            for row in fetch_chunk(cur, chunk_end):
-                ts = row["timestamp"]
-                if start_dt.timestamp() <= ts < end_dt.timestamp():
-                    all_rows[ts] = row
+            req = Request(url, headers={
+                "User-Agent": "Mozilla/5.0 DOGE-CSV-Exporter",
+                "Accept": "application/json",
+            })
+            with urlopen(req, timeout=25) as r:
+                data = json.loads(r.read().decode("utf-8"))
+
+            rows = {}
+            for k in data:
+                if isinstance(k, list) and len(k) >= 6:
+                    ts = int(k[0])
+                    rows[ts] = [
+                        ts,
+                        datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
+                        float(k[3]), float(k[2]), float(k[1]),
+                        float(k[4]), float(k[5])
+                    ]
+            return rows
         except Exception as e:
-            print("chunk error:", cur, chunk_end, repr(e), flush=True)
-            time.sleep(1.0)
-            # one retry
-            for row in fetch_chunk(cur, chunk_end):
-                ts = row["timestamp"]
-                if start_dt.timestamp() <= ts < end_dt.timestamp():
-                    all_rows[ts] = row
+            last_error = e
+            time.sleep(1.5 * (attempt + 1))
 
-        cur = chunk_end + timedelta(minutes=1)
-        time.sleep(0.16)
+    raise RuntimeError(str(last_error))
 
-    return [all_rows[k] for k in sorted(all_rows)], start_dt, end_dt
+def build_csv():
+    try:
+        with state_lock:
+            state.update({
+                "status": "running",
+                "progress": 0,
+                "message": "Preparing 60-day DOGE data...",
+                "rows": 0,
+                "error": None,
+            })
+
+        end_dt = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        start_dt = end_dt - timedelta(days=DAYS)
+
+        chunks = []
+        cur = start_dt
+        while cur < end_dt:
+            chunk_end = min(cur + timedelta(minutes=CHUNK_MINUTES), end_dt)
+            chunks.append((cur, chunk_end))
+            cur = chunk_end + timedelta(minutes=1)
+
+        all_rows = {}
+        total = len(chunks)
+
+        for i, (a, b) in enumerate(chunks, start=1):
+            part = fetch_chunk(a, b)
+            all_rows.update(part)
+
+            with state_lock:
+                state["progress"] = int(i * 100 / total)
+                state["rows"] = len(all_rows)
+                state["message"] = f"Fetching... {state['progress']}%"
+
+            time.sleep(0.12)
+
+        with open(CSV_PATH + ".part", "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["timestamp", "datetime_utc", "open", "high", "low", "close", "volume"])
+            for ts in sorted(all_rows):
+                w.writerow(all_rows[ts])
+
+        os.replace(CSV_PATH + ".part", CSV_PATH)
+
+        with state_lock:
+            state.update({
+                "status": "ready",
+                "progress": 100,
+                "message": "CSV ready — tap Download CSV",
+                "rows": len(all_rows),
+                "error": None,
+            })
+
+    except Exception as e:
+        with state_lock:
+            state.update({
+                "status": "error",
+                "message": "Export failed",
+                "error": repr(e),
+            })
 
 @app.get("/")
 def home():
-    return """
-    <h2>ADAUSDT 60-Day 1-Minute CSV Exporter</h2>
-    <p>Coinbase public ADA-USD candles are exported as ADAUSDT-style data for strategy testing.</p>
-    <p><a href="/export">Download ADAUSDT_60day_1m.csv</a></p>
-    """
+    return """<!doctype html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DOGE 60-Day CSV Exporter</title>
+<style>
+body{font-family:Arial,sans-serif;background:#f5f5f5;padding:20px}
+.card{max-width:650px;margin:auto;background:white;padding:20px;border-radius:14px}
+button,a{display:inline-block;padding:12px 16px;margin-top:10px;border-radius:9px;border:0;text-decoration:none;font-size:16px}
+button{background:#111;color:#fff}.download{background:#1976d2;color:#fff}
+.bar{height:18px;background:#ddd;border-radius:20px;overflow:hidden;margin-top:16px}
+.fill{height:100%;width:0;background:#1976d2}
+small{display:block;margin-top:10px;color:#555}
+</style>
+</head>
+<body>
+<div class="card">
+<h2>DOGEUSDT 60-Day 1-Minute CSV Exporter</h2>
+<p>This version prepares the file in the background to avoid browser timeout.</p>
+<button onclick="startJob()">Prepare 60-Day CSV</button>
+<a id="download" class="download" href="/download" style="display:none">Download CSV</a>
+<div class="bar"><div id="fill" class="fill"></div></div>
+<p id="status">Ready</p>
+<small id="details"></small>
+</div>
+<script>
+async function startJob(){
+  await fetch('/start',{method:'POST'});
+  poll();
+}
+async function poll(){
+  try{
+    let r=await fetch('/status?_='+Date.now());
+    let j=await r.json();
+    document.getElementById('fill').style.width=(j.progress||0)+'%';
+    document.getElementById('status').textContent=j.message||j.status;
+    document.getElementById('details').textContent='Rows: '+(j.rows||0)+(j.error?' | '+j.error:'');
+    document.getElementById('download').style.display=j.status==='ready'?'inline-block':'none';
+    if(j.status==='running') setTimeout(poll,1500);
+  }catch(e){setTimeout(poll,2500)}
+}
+poll();
+</script>
+</body>
+</html>"""
 
-@app.get("/export")
-def export_csv():
-    rows, start_dt, end_dt = fetch_60_days()
+@app.post("/start")
+def start():
+    global worker_thread
+    with state_lock:
+        if state["status"] == "running":
+            return jsonify(state)
+    worker_thread = threading.Thread(target=build_csv, daemon=True)
+    worker_thread.start()
+    return jsonify({"ok": True})
 
-    out = io.StringIO()
-    w = csv.writer(out)
-    w.writerow(["timestamp", "datetime_utc", "open", "high", "low", "close", "volume"])
-    for r in rows:
-        w.writerow([
-            r["timestamp"],
-            r["datetime_utc"],
-            r["open"],
-            r["high"],
-            r["low"],
-            r["close"],
-            r["volume"],
-        ])
+@app.get("/status")
+def status():
+    return jsonify(state)
 
-    filename = "ADAUSDT_60day_1m.csv"
-    return Response(
-        out.getvalue(),
+@app.get("/download")
+def download():
+    if not os.path.exists(CSV_PATH):
+        return Response("CSV not ready yet.", status=404)
+    return send_file(
+        CSV_PATH,
+        as_attachment=True,
+        download_name="DOGEUSDT_60day_1m.csv",
         mimetype="text/csv",
-        headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
-            "X-Data-Start": start_dt.isoformat(),
-            "X-Data-End": end_dt.isoformat(),
-            "X-Row-Count": str(len(rows)),
-        },
+        max_age=0,
     )
 
+@app.get("/health")
+def health():
+    return jsonify({"ok": True, "status": state["status"]})
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
+    port = int(os.environ.get("PORT", "8080"))
+    app.run(host="0.0.0.0", port=port, threaded=True)
