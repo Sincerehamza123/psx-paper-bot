@@ -16,9 +16,7 @@ COINBASE_CANDLES_URL='https://api.exchange.coinbase.com/products/{product_id}/ca
 STARTING_CAPITAL=100.0
 POSITION_PCT=0.10
 MAX_OPEN_POSITIONS=5
-CE_ATR_PERIOD=1
-CE_ATR_MULTIPLIER=2.0
-ZLSMA_PERIOD=50
+CP1_REVERSE=True
 COOLDOWN_BARS=0
 COMMISSION_PCT_PER_SIDE=0.0005
 SLIPPAGE_PCT_PER_SIDE=0.0001
@@ -63,9 +61,24 @@ def set_state(key,value):
         s.commit()
 
 def init_db():
+    version='cp1-v1'
     with _db_lock, SessionLocal() as s:
-        if not s.get(State,'cash'): s.add(State(key='cash',value=str(STARTING_CAPITAL)))
-        if not s.get(State,'strategy_version'): s.add(State(key='strategy_version',value='cezlsma-v1'))
+        if not s.get(State,'cash'):
+            s.add(State(key='cash',value=str(STARTING_CAPITAL)))
+        sv=s.get(State,'strategy_version')
+        if not sv:
+            s.add(State(key='strategy_version',value=version))
+        elif sv.value!=version:
+            # Preserve closed-trade history/cash, but old-strategy open positions
+            # cannot safely continue under CP1 fixed stop/target rules.
+            s.execute(delete(Position)); s.execute(delete(ProcessedBar)); s.execute(delete(Cooldown))
+            sv.value=version
+            br=s.get(State,'bt_result')
+            if br: br.value=''
+            bs=s.get(State,'bt_status')
+            if bs: bs.value='idle'
+            bm=s.get(State,'bt_message')
+            if bm: bm.value=''
         s.commit()
 
 def current_cash(s):
@@ -79,109 +92,35 @@ def set_cash(s,amount):
     if r: r.value=str(amount)
     else: s.add(State(key='cash',value=str(amount)))
 
-def _linreg_series(vals,p):
-    """TradingView-style ta.linreg(source, length, 0), O(n)."""
-    n=len(vals); out=[None]*n
-    if p<=1:
-        return [float(v) for v in vals]
-    sx=p*(p-1)/2.0
-    sx2=p*(p-1)*(2*p-1)/6.0
-    den=p*sx2-sx*sx
-    if n<p: return out
-    sy=sum(float(v) for v in vals[:p])
-    sxy=sum(i*float(vals[i]) for i in range(p))
-    def calc(sy,sxy):
-        slope=(p*sxy-sx*sy)/den
-        intercept=(sy-slope*sx)/p
-        return intercept+slope*(p-1)
-    out[p-1]=calc(sy,sxy)
-    for i in range(p,n):
-        old=float(vals[i-p]); new=float(vals[i]); old_sy=sy
-        sxy=sxy-(old_sy-old)+(p-1)*new
-        sy=old_sy-old+new
-        out[i]=calc(sy,sxy)
-    return out
+def cp1_pattern(cs):
+    """Geraked CP1 candlestick setup on the most recent two CLOSED candles.
 
-def _heikin_ashi(cs):
-    out=[]; prev_open=None; prev_close=None
-    for c in cs:
-        hc=(c['open']+c['high']+c['low']+c['close'])/4.0
-        ho=(c['open']+c['close'])/2.0 if prev_open is None else (prev_open+prev_close)/2.0
-        hh=max(c['high'],ho,hc); hl=min(c['low'],ho,hc)
-        out.append({'open':ho,'high':hh,'low':hl,'close':hc})
-        prev_open,prev_close=ho,hc
-    return out
-
-def _true_ranges(cs):
-    out=[]
-    for i,c in enumerate(cs):
-        if i==0: tr=c['high']-c['low']
-        else:
-            pc=cs[i-1]['close']
-            tr=max(c['high']-c['low'],abs(c['high']-pc),abs(c['low']-pc))
-        out.append(tr)
-    return out
-
-def _rma(vals,p):
-    # Pine ta.atr uses Wilder RMA. With p=1, ATR equals true range.
-    n=len(vals); out=[None]*n
-    if n<p: return out
-    seed=sum(vals[:p])/p; out[p-1]=seed; prev=seed
-    for i in range(p,n):
-        prev=(prev*(p-1)+vals[i])/p; out[i]=prev
-    return out
-
-def cezlsma_state(cs):
-    """Geraked CEZLSMA rules, applied to Heikin-Ashi candles.
-    Returns latest signal, ZLSMA-cross exit flags, and Chandelier stops.
+    Original Pine defaults Reverse Signal=True. Therefore:
+      bullish CP1 pattern -> SHORT
+      bearish CP1 pattern -> LONG
+    The signal candle low/high is the profit target in reverse mode and
+    the stop is placed at equal distance on the opposite side (1:1 RR).
     """
-    if len(cs)<(ZLSMA_PERIOD*2):
-        return {'signal':None,'exit_long':False,'exit_short':False,'long_stop':None,'short_stop':None,'zlsma':None}
-    ha=_heikin_ashi(cs)
-    closes=[c['close'] for c in ha]
-    trs=_true_ranges(ha); atr=_rma(trs,CE_ATR_PERIOD)
-    n=len(ha)
-    long_stop=[None]*n; short_stop=[None]*n; direction=[1]*n
-    for i in range(n):
-        if atr[i] is None: continue
-        a=CE_ATR_MULTIPLIER*atr[i]
-        lo=max(closes[max(0,i-CE_ATR_PERIOD+1):i+1])-a
-        sh=min(closes[max(0,i-CE_ATR_PERIOD+1):i+1])+a
-        if i==0 or long_stop[i-1] is None:
-            long_stop[i]=lo; short_stop[i]=sh; direction[i]=1
-            continue
-        lprev=long_stop[i-1]; sprev=short_stop[i-1]
-        long_stop[i]=max(lo,lprev) if closes[i-1]>lprev else lo
-        short_stop[i]=min(sh,sprev) if closes[i-1]<sprev else sh
-        if closes[i]>sprev: direction[i]=1
-        elif closes[i]<lprev: direction[i]=-1
-        else: direction[i]=direction[i-1]
-
-    lsma=_linreg_series(closes,ZLSMA_PERIOD)
-    # second LSMA starts once the first LSMA has a full valid region
-    valid=[x for x in lsma if x is not None]
-    lsma2_valid=_linreg_series(valid,ZLSMA_PERIOD)
-    lsma2=[None]*n
-    first=ZLSMA_PERIOD-1
-    for j,v in enumerate(lsma2_valid):
-        if v is not None: lsma2[first+j]=v
-    z=[None]*n
-    for i in range(n):
-        if lsma[i] is not None and lsma2[i] is not None:
-            z[i]=lsma[i]+(lsma[i]-lsma2[i])
-    i=n-1
-    if i<1 or z[i] is None or z[i-1] is None:
-        return {'signal':None,'exit_long':False,'exit_short':False,'long_stop':long_stop[i],'short_stop':short_stop[i],'zlsma':z[i]}
-    buy=(direction[i]==1 and direction[i-1]==-1 and closes[i]>z[i])
-    sell=(direction[i]==-1 and direction[i-1]==1 and closes[i]<z[i])
-    crossunder=(closes[i]<z[i] and closes[i-1]>=z[i-1])
-    crossover=(closes[i]>z[i] and closes[i-1]<=z[i-1])
-    return {'signal':'LONG' if buy else ('SHORT' if sell else None),
-            'exit_long':crossunder,'exit_short':crossover,
-            'long_stop':long_stop[i],'short_stop':short_stop[i],'zlsma':z[i]}
+    if len(cs)<2:
+        return None
+    prev=cs[-2]; cur=cs[-1]
+    long_signal=(cur['close']>cur['open'] and prev['close']>prev['open'] and
+                 prev['open']<cur['open'] and cur['close']>prev['close'] and
+                 cur['low']<prev['low'] and cur['low']<prev['open'])
+    short_signal=(cur['close']<cur['open'] and prev['close']<prev['open'] and
+                  prev['open']>cur['open'] and cur['close']<prev['close'] and
+                  cur['high']>prev['high'] and cur['high']>prev['open'])
+    if long_signal:
+        return {'side':'SHORT' if CP1_REVERSE else 'LONG',
+                'signal_kind':'BULL_PATTERN','level':cur['low']}
+    if short_signal:
+        return {'side':'LONG' if CP1_REVERSE else 'SHORT',
+                'signal_kind':'BEAR_PATTERN','level':cur['high']}
+    return None
 
 def signal_on_last_bar(cs):
-    return cezlsma_state(cs)['signal']
+    x=cp1_pattern(cs)
+    return x['side'] if x else None
 
 def fetch_klines(symbol,limit=180):
     pid=COINBASE_SYMBOL_MAP.get(symbol)
@@ -201,42 +140,73 @@ def set_cooldown(s,symbol,t):
     if r: r.until_close_time_ms=until
     else: s.add(Cooldown(symbol=symbol,until_close_time_ms=until))
 
-def open_position(s,symbol,c,side):
-    if s.get(Position,symbol): return
-    if (s.scalar(select(func.count()).select_from(Position)) or 0)>=MAX_OPEN_POSITIONS: return
+def open_cp1_position(s,symbol,c,setup):
+    if s.get(Position,symbol): return None
+    if (s.scalar(select(func.count()).select_from(Position)) or 0)>=MAX_OPEN_POSITIONS: return None
     cd=s.get(Cooldown,symbol)
-    if cd and c['close_time_ms']<=cd.until_close_time_ms: return
-    n=current_cash(s)*POSITION_PCT; raw=c['close']
-    entry=raw*(1+SLIPPAGE_PCT_PER_SIDE) if side=='LONG' else raw*(1-SLIPPAGE_PCT_PER_SIDE)
-    s.add(Position(symbol=symbol,side=side,entry_time=datetime.fromtimestamp(c['close_time_ms']/1000,tz=timezone.utc).isoformat(),entry_close_time_ms=c['close_time_ms'],raw_entry_price=raw,entry_price=entry,notional=n,bars_held=0))
+    if cd and c['close_time_ms']<=cd.until_close_time_ms: return None
+    side=setup['side']; raw_open=float(c['open'])
+    entry=raw_open*(1+SLIPPAGE_PCT_PER_SIDE) if side=='LONG' else raw_open*(1-SLIPPAGE_PCT_PER_SIDE)
+    level=float(setup['level'])
+    if CP1_REVERSE:
+        target=level
+        stop=2*entry-target
+    else:
+        stop=level
+        target=2*entry-stop
+    if side=='LONG' and not (stop<entry<target): return None
+    if side=='SHORT' and not (target<entry<stop): return None
+    n=current_cash(s)*POSITION_PCT
+    # Position.raw_entry_price stores CP1's fixed stop to avoid a schema change.
+    p=Position(symbol=symbol,side=side,
+               entry_time=datetime.fromtimestamp(c['open_time_ms']/1000,tz=timezone.utc).isoformat(),
+               entry_close_time_ms=c['close_time_ms'],raw_entry_price=stop,
+               entry_price=entry,notional=n,bars_held=0)
+    s.add(p); s.flush(); return p
+
+def cp1_levels(pos):
+    stop=float(pos.raw_entry_price); entry=float(pos.entry_price); target=2*entry-stop
+    return stop,target
 
 def close_position(s,pos,c,raw_exit,reason):
     side=getattr(pos,'side','LONG') or 'LONG'; entry=pos.entry_price; n=pos.notional
     exitp=float(raw_exit)*(1-SLIPPAGE_PCT_PER_SIDE) if side=='LONG' else float(raw_exit)*(1+SLIPPAGE_PCT_PER_SIDE)
     gr=(exitp-entry)/entry if side=='LONG' else (entry-exitp)/entry
     gross=n*gr; fee=n*COMMISSION_PCT_PER_SIDE+max(0,n*(1+gr))*COMMISSION_PCT_PER_SIDE; net=gross-fee
-    s.add(Trade(symbol=pos.symbol,entry_time=pos.entry_time,exit_time=datetime.fromtimestamp(c['close_time_ms']/1000,tz=timezone.utc).isoformat(),raw_entry_price=pos.raw_entry_price,entry_price=entry,raw_exit_price=float(raw_exit),exit_price=exitp,notional=n,gross_pl=gross,commission=fee,net_pl=net,return_pct=(net/n)*100 if n else 0,reason=side+' '+reason)); set_cash(s,current_cash(s)+net); set_cooldown(s,pos.symbol,c['close_time_ms']); s.delete(pos)
+    s.add(Trade(symbol=pos.symbol,entry_time=pos.entry_time,
+                exit_time=datetime.fromtimestamp(c['close_time_ms']/1000,tz=timezone.utc).isoformat(),
+                raw_entry_price=entry,entry_price=entry,raw_exit_price=float(raw_exit),exit_price=exitp,
+                notional=n,gross_pl=gross,commission=fee,net_pl=net,
+                return_pct=(net/n)*100 if n else 0,reason=side+' '+reason))
+    set_cash(s,current_cash(s)+net); set_cooldown(s,pos.symbol,c['close_time_ms']); s.delete(pos)
+
+def maybe_exit_cp1(s,pos,c):
+    stop,target=cp1_levels(pos); side=getattr(pos,'side','LONG') or 'LONG'
+    # Conservative same-candle assumption: if both levels trade, count stop first.
+    if side=='LONG':
+        if c['low']<=stop: close_position(s,pos,c,stop,'SL'); return True
+        if c['high']>=target: close_position(s,pos,c,target,'TP'); return True
+    else:
+        if c['high']>=stop: close_position(s,pos,c,stop,'SL'); return True
+        if c['low']<=target: close_position(s,pos,c,target,'TP'); return True
+    return False
 
 def process_symbol(symbol):
     cs=fetch_klines(symbol,limit=180); last=cs[-1] if cs else None
     if not last: return
-    state=cezlsma_state(cs)
     with _db_lock, SessionLocal() as s:
         if s.get(ProcessedBar,{'symbol':symbol,'close_time_ms':last['close_time_ms']}): return
         pos=s.get(Position,symbol)
-        if pos and last['close_time_ms']>pos.entry_close_time_ms:
-            pos.bars_held+=1; side=getattr(pos,'side','LONG') or 'LONG'
-            if side=='LONG':
-                stop=state.get('long_stop')
-                if stop is not None and last['low']<=stop: close_position(s,pos,last,stop,'CE-SL')
-                elif state.get('exit_long'): close_position(s,pos,last,last['close'],'ZLSMA')
-            else:
-                stop=state.get('short_stop')
-                if stop is not None and last['high']>=stop: close_position(s,pos,last,stop,'CE-SL')
-                elif state.get('exit_short'): close_position(s,pos,last,last['close'],'ZLSMA')
-        if not s.get(Position,symbol):
-            side=state.get('signal')
-            if side: open_position(s,symbol,last,side)
+        if pos:
+            pos.bars_held+=1
+            maybe_exit_cp1(s,pos,last)
+        # TradingView strategy orders normally fill on the NEXT bar.
+        # So detect CP1 on the previous closed candle pair and enter at this bar's open.
+        if not s.get(Position,symbol) and len(cs)>=3:
+            setup=cp1_pattern(cs[:-1])
+            if setup:
+                pos=open_cp1_position(s,symbol,last,setup)
+                if pos: maybe_exit_cp1(s,pos,last)
         s.add(ProcessedBar(symbol=symbol,close_time_ms=last['close_time_ms'])); s.commit()
 
 def worker_loop():
@@ -275,22 +245,37 @@ def fetch_historical_day(symbol,day_start,range_start,range_end):
 def run_backtest_15d():
     global _backtest_running
     try:
-        set_state('bt_status','running'); set_state('bt_progress','0'); set_state('bt_message','Starting CEZLSMA 15-day backtest...'); set_state('bt_result','')
+        set_state('bt_status','running'); set_state('bt_progress','0'); set_state('bt_message','Starting CP1 15-day backtest...'); set_state('bt_result','')
         end_dt=datetime.now(timezone.utc).replace(second=0,microsecond=0); start_dt=end_dt-timedelta(days=15)
         capital=STARTING_CAPITAL; hist={s:[] for s in SYMBOLS}; pos={}; lastc={}; unavailable=set()
-        st={'trades':0,'wins':0,'losses':0,'gross':0.0,'costs':0.0,'net':0.0,'ce_count':0,'zlsma_count':0,'end_count':0,'ce_net':0.0,'zlsma_net':0.0,'end_net':0.0}
+        st={'trades':0,'wins':0,'losses':0,'gross':0.0,'costs':0.0,'net':0.0,
+            'tp_count':0,'sl_count':0,'end_count':0,'tp_net':0.0,'sl_net':0.0,'end_net':0.0,
+            'long_count':0,'short_count':0,'long_net':0.0,'short_net':0.0}
         def close_bt(sym,c,raw,reason):
             nonlocal capital
-            p=pos.pop(sym); entry=p['entry']; n=p['notional']; side=p.get('side','LONG')
+            p=pos.pop(sym); entry=p['entry']; n=p['notional']; side=p['side']
             exitp=float(raw)*(1-SLIPPAGE_PCT_PER_SIDE) if side=='LONG' else float(raw)*(1+SLIPPAGE_PCT_PER_SIDE)
             gr=(exitp-entry)/entry if side=='LONG' else (entry-exitp)/entry
             gross=n*gr; fee=n*COMMISSION_PCT_PER_SIDE+max(0,n*(1+gr))*COMMISSION_PCT_PER_SIDE; net=gross-fee
             capital+=net; st['trades']+=1; st['gross']+=gross; st['costs']+=fee; st['net']+=net
-            if reason=='CE-SL': st['ce_count']+=1; st['ce_net']+=net
-            elif reason=='ZLSMA': st['zlsma_count']+=1; st['zlsma_net']+=net
+            if reason=='TP': st['tp_count']+=1; st['tp_net']+=net
+            elif reason=='SL': st['sl_count']+=1; st['sl_net']+=net
             else: st['end_count']+=1; st['end_net']+=net
+            if side=='LONG': st['long_count']+=1; st['long_net']+=net
+            else: st['short_count']+=1; st['short_net']+=net
             if net>0: st['wins']+=1
             else: st['losses']+=1
+        def check_exit(sym,c):
+            p=pos.get(sym)
+            if not p: return False
+            side=p['side']; stop=p['stop']; target=p['target']
+            if side=='LONG':
+                if c['low']<=stop: close_bt(sym,c,stop,'SL'); return True
+                if c['high']>=target: close_bt(sym,c,target,'TP'); return True
+            else:
+                if c['high']>=stop: close_bt(sym,c,stop,'SL'); return True
+                if c['low']<=target: close_bt(sym,c,target,'TP'); return True
+            return False
         fd=start_dt.replace(hour=0,minute=0,second=0,microsecond=0)
         for d in range(16):
             ds=fd+timedelta(days=d)
@@ -299,37 +284,48 @@ def run_backtest_15d():
             for sym in SYMBOLS:
                 if sym in unavailable: continue
                 try:
-                    for c in fetch_historical_day(sym,ds,start_dt,end_dt): ev.append((c['open_time_ms'],sym,c))
+                    rows=fetch_historical_day(sym,ds,start_dt,end_dt)
+                    for c in rows: ev.append((c['open_time_ms'],sym,c))
                 except Exception as e: print('[backtest]',sym,type(e).__name__,e,flush=True)
             ev.sort(key=lambda z:(z[0],z[1]))
             for _,sym,c in ev:
                 lastc[sym]=c; h=hist[sym]; h.append(c)
                 if len(h)>180: del h[:-180]
-                if len(h)<(ZLSMA_PERIOD*2): continue
-                state=cezlsma_state(h)
-                p=pos.get(sym)
-                if p and c['close_time_ms']>p['t']:
-                    side=p.get('side','LONG')
-                    if side=='LONG':
-                        stop=state.get('long_stop')
-                        if stop is not None and c['low']<=stop: close_bt(sym,c,stop,'CE-SL')
-                        elif state.get('exit_long'): close_bt(sym,c,c['close'],'ZLSMA')
-                    else:
-                        stop=state.get('short_stop')
-                        if stop is not None and c['high']>=stop: close_bt(sym,c,stop,'CE-SL')
-                        elif state.get('exit_short'): close_bt(sym,c,c['close'],'ZLSMA')
-                if sym not in pos and len(pos)<MAX_OPEN_POSITIONS:
-                    side=state.get('signal')
-                    if side:
-                        entry=c['close']*(1+SLIPPAGE_PCT_PER_SIDE) if side=='LONG' else c['close']*(1-SLIPPAGE_PCT_PER_SIDE)
-                        pos[sym]={'t':c['close_time_ms'],'entry':entry,'notional':capital*POSITION_PCT,'side':side}
+                # Existing position first: it was entered on an earlier bar.
+                if sym in pos: check_exit(sym,c)
+                # CP1 signal is confirmed on previous bar, entry at CURRENT bar open.
+                if sym not in pos and len(pos)<MAX_OPEN_POSITIONS and len(h)>=3:
+                    setup=cp1_pattern(h[:-1])
+                    if setup:
+                        side=setup['side']; raw_open=float(c['open'])
+                        entry=raw_open*(1+SLIPPAGE_PCT_PER_SIDE) if side=='LONG' else raw_open*(1-SLIPPAGE_PCT_PER_SIDE)
+                        level=float(setup['level'])
+                        if CP1_REVERSE: target=level; stop=2*entry-target
+                        else: stop=level; target=2*entry-stop
+                        valid=(stop<entry<target) if side=='LONG' else (target<entry<stop)
+                        if valid:
+                            pos[sym]={'t':c['close_time_ms'],'entry':entry,'notional':capital*POSITION_PCT,
+                                      'side':side,'stop':stop,'target':target}
+                            check_exit(sym,c)
             pct=min(99,int(((ds-start_dt).total_seconds()/(end_dt-start_dt).total_seconds())*100)+3)
-            set_state('bt_progress',pct); set_state('bt_message',f"CEZLSMA through {ds.date()} • trades {st['trades']} • capital ${capital:.2f}")
+            set_state('bt_progress',pct); set_state('bt_message',f"CP1 through {ds.date()} • trades {st['trades']} • capital ${capital:.2f}")
         for sym in list(pos):
             if sym in lastc: close_bt(sym,lastc[sym],lastc[sym]['close'],'END')
         tr=st['trades']; w=st['wins']
-        result={'strategy':'CEZLSMA — Chandelier Exit + ZLSMA (Heikin Ashi)','days':15,'pairs_requested':len(SYMBOLS),'pairs_used':len(SYMBOLS)-len(unavailable),'trades':tr,'wins':w,'losses':st['losses'],'win_rate':round((w/tr*100) if tr else 0,2),'gross_pl':round(st['gross'],4),'costs':round(st['costs'],4),'net_pl':round(st['net'],4),'starting_capital':STARTING_CAPITAL,'final_capital':round(capital,4),'return_pct':round((capital/STARTING_CAPITAL-1)*100,3),'ce_count':st['ce_count'],'zlsma_count':st['zlsma_count'],'ce_net':round(st['ce_net'],4),'zlsma_net':round(st['zlsma_net'],4),'ce_pct':round((st['ce_count']/tr*100) if tr else 0,2),'zlsma_pct':round((st['zlsma_count']/tr*100) if tr else 0,2)}
-        set_state('bt_result',json.dumps(result)); set_state('bt_progress','100'); set_state('bt_message','CEZLSMA 15-day backtest completed.'); set_state('bt_status','completed')
+        result={'strategy':'CP1 — Candlestick Pattern Strategy 1 (Reverse ON)','days':15,
+                'pairs_requested':len(SYMBOLS),'pairs_used':len(SYMBOLS)-len(unavailable),
+                'trades':tr,'wins':w,'losses':st['losses'],'win_rate':round((w/tr*100) if tr else 0,2),
+                'gross_pl':round(st['gross'],4),'costs':round(st['costs'],4),'net_pl':round(st['net'],4),
+                'starting_capital':STARTING_CAPITAL,'final_capital':round(capital,4),
+                'return_pct':round((capital/STARTING_CAPITAL-1)*100,3),
+                'tp_count':st['tp_count'],'sl_count':st['sl_count'],'end_count':st['end_count'],
+                'tp_net':round(st['tp_net'],4),'sl_net':round(st['sl_net'],4),'end_net':round(st['end_net'],4),
+                'tp_pct':round((st['tp_count']/tr*100) if tr else 0,2),
+                'sl_pct':round((st['sl_count']/tr*100) if tr else 0,2),
+                'end_pct':round((st['end_count']/tr*100) if tr else 0,2),
+                'long_count':st['long_count'],'short_count':st['short_count'],
+                'long_net':round(st['long_net'],4),'short_net':round(st['short_net'],4)}
+        set_state('bt_result',json.dumps(result)); set_state('bt_progress','100'); set_state('bt_message','CP1 15-day backtest completed.'); set_state('bt_status','completed')
     except Exception as e:
         set_state('bt_status','error'); set_state('bt_message',type(e).__name__+': '+str(e)); print('[backtest] fatal',e,flush=True)
     finally:
@@ -361,7 +357,7 @@ def start_backtest():
         _backtest_running=True; threading.Thread(target=run_backtest_15d,daemon=True).start()
     return redirect(url_for('dashboard'))
 
-HTML='''<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="20"><style>body{font-family:Arial;background:#10131a;color:#eee;padding:14px;max-width:1100px;margin:auto}.g{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px}.c,.n,.bt{background:#1b202b;padding:13px;border-radius:12px}.l{font-size:12px;color:#aaa}.v{font-size:22px;font-weight:700}table{width:100%;border-collapse:collapse;background:#1b202b;margin-top:12px}td,th{padding:8px;border-bottom:1px solid #333;font-size:12px;text-align:left}.n,.bt{margin:14px 0}.ok{color:#78d98b}.bad{color:#ff9c9c}button{background:#fff;color:#111;border:0;border-radius:8px;padding:10px 14px;font-weight:700}.p{height:10px;background:#303746;border-radius:8px;overflow:hidden;margin:8px 0}.pb{height:100%;background:#ddd}.small{color:#aaa;font-size:12px}</style><h2>Crypto 1m Automatic Paper Bot — CEZLSMA</h2><p>Coinbase public 1m data • No API key • No real orders • 20 pairs</p><div class=n><b>Storage:</b> {% if persistent %}<span class=ok>Persistent database connected ✅</span>{% else %}<span class=bad>Temporary SQLite ⚠️ — restart/redeploy can erase history</span>{% endif %}</div><div class=g>{% for k,v in cards %}<div class=c><div class=l>{{k}}</div><div class=v>{{v}}</div></div>{% endfor %}</div><div class=n><b>Strategy:</b> CEZLSMA (Chandelier Exit + ZLSMA), using Heikin-Ashi candles for signals.<br><b>Chandelier Exit:</b> ATR period 1, multiplier 2.<br><b>ZLSMA:</b> period 50.<br><b>LONG:</b> CE flips to BUY and HA close is above ZLSMA.<br><b>SHORT:</b> CE flips to SELL and HA close is below ZLSMA.<br><b>Exit:</b> Chandelier stop or opposite ZLSMA cross. No fixed TP / time exit.<br><b>Risk:</b> max 5 open positions, 10% capital/trade.<br><b>Costs:</b> fee 0.05%/side + slippage 0.01%/side.</div><div class=bt><h3>15-Day Backtest — CEZLSMA</h3>{% if bt_status=='running' %}<b>Running: {{bt_progress}}%</b><div class=p><div class=pb style="width:{{bt_progress}}%"></div></div><div class=small>{{bt_message}}</div>{% else %}<form method=post action=/backtest/start><button>Run 15-Day Backtest</button></form>{% if bt_message %}<p class=small>{{bt_message}}</p>{% endif %}{% endif %}{% if bt_result %}<div class=g><div class=c><div class=l>BT Trades</div><div class=v>{{bt_result.trades}}</div></div><div class=c><div class=l>BT Win Rate</div><div class=v>{{bt_result.win_rate}}%</div></div><div class=c><div class=l>BT Net P/L</div><div class=v>$ {{bt_result.net_pl}}</div></div><div class=c><div class=l>BT Final Capital</div><div class=v>$ {{bt_result.final_capital}}</div></div><div class=c><div class=l>BT Return</div><div class=v>{{bt_result.return_pct}}%</div></div></div><h4>Exit Diagnostics</h4><table><tr><th>Exit</th><th>Count</th><th>% Trades</th><th>Net P/L</th></tr><tr><td>CE Stop</td><td>{{bt_result.ce_count}}</td><td>{{bt_result.ce_pct}}%</td><td>$ {{bt_result.ce_net}}</td></tr><tr><td>ZLSMA Cross</td><td>{{bt_result.zlsma_count}}</td><td>{{bt_result.zlsma_pct}}%</td><td>$ {{bt_result.zlsma_net}}</td></tr></table>{% endif %}</div><h3>Open Positions</h3><table><tr><th>Pair</th><th>Side</th><th>Entry</th><th>$ Notional</th><th>Bars</th></tr>{% for p in positions %}<tr><td>{{p.symbol}}</td><td>{{p.side}}</td><td>{{'%.8f'|format(p.entry_price)}}</td><td>{{'%.2f'|format(p.notional)}}</td><td>{{p.bars_held}}</td></tr>{% else %}<tr><td colspan=5>None</td></tr>{% endfor %}</table><h3>Latest Trades</h3><table><tr><th>Pair</th><th>Exit</th><th>P/L</th><th>Return</th></tr>{% for t in trades %}<tr><td>{{t.symbol}}</td><td>{{t.reason}}</td><td>$ {{'%.4f'|format(t.net_pl)}}</td><td>{{'%.3f'|format(t.return_pct)}}%</td></tr>{% else %}<tr><td colspan=4>No trades yet</td></tr>{% endfor %}</table><form method=post action=/reset_demo><p><button>Reset Live Demo</button></p></form>'''
+HTML='''<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="20"><style>body{font-family:Arial;background:#10131a;color:#eee;padding:14px;max-width:1100px;margin:auto}.g{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px}.c,.n,.bt{background:#1b202b;padding:13px;border-radius:12px}.l{font-size:12px;color:#aaa}.v{font-size:22px;font-weight:700}table{width:100%;border-collapse:collapse;background:#1b202b;margin-top:12px}td,th{padding:8px;border-bottom:1px solid #333;font-size:12px;text-align:left}.n,.bt{margin:14px 0}.ok{color:#78d98b}.bad{color:#ff9c9c}button{background:#fff;color:#111;border:0;border-radius:8px;padding:10px 14px;font-weight:700}.p{height:10px;background:#303746;border-radius:8px;overflow:hidden;margin:8px 0}.pb{height:100%;background:#ddd}.small{color:#aaa;font-size:12px}</style><h2>Crypto 1m Automatic Paper Bot — CP1</h2><p>Coinbase public 1m data • No API key • No real orders • 20 pairs</p><div class=n><b>Storage:</b> {% if persistent %}<span class=ok>Persistent database connected ✅</span>{% else %}<span class=bad>Temporary SQLite ⚠️ — restart/redeploy can erase history</span>{% endif %}</div><div class=g>{% for k,v in cards %}<div class=c><div class=l>{{k}}</div><div class=v>{{v}}</div></div>{% endfor %}</div><div class=n><b>Strategy:</b> CP1 — Candlestick Pattern Strategy 1.<br><b>Original setting:</b> Reverse Signal = ON.<br><b>Bullish CP1 pattern:</b> enters SHORT on next 1m candle open.<br><b>Bearish CP1 pattern:</b> enters LONG on next 1m candle open.<br><b>Exit:</b> signal-candle high/low target with equal-distance stop (1:1 gross R:R).<br><b>Execution:</b> next-bar open; if TP and SL both touch in one candle, SL is counted first (conservative).<br><b>Risk:</b> max 5 open positions, 10% capital/trade.<br><b>Costs:</b> fee 0.05%/side + slippage 0.01%/side.</div><div class=bt><h3>15-Day Backtest — CP1</h3>{% if bt_status=='running' %}<b>Running: {{bt_progress}}%</b><div class=p><div class=pb style="width:{{bt_progress}}%"></div></div><div class=small>{{bt_message}}</div>{% else %}<form method=post action=/backtest/start><button>Run 15-Day Backtest</button></form>{% if bt_message %}<p class=small>{{bt_message}}</p>{% endif %}{% endif %}{% if bt_result %}<div class=g><div class=c><div class=l>BT Trades</div><div class=v>{{bt_result.trades}}</div></div><div class=c><div class=l>BT Win Rate</div><div class=v>{{bt_result.win_rate}}%</div></div><div class=c><div class=l>BT Net P/L</div><div class=v>$ {{bt_result.net_pl}}</div></div><div class=c><div class=l>BT Final Capital</div><div class=v>$ {{bt_result.final_capital}}</div></div><div class=c><div class=l>BT Return</div><div class=v>{{bt_result.return_pct}}%</div></div></div><h4>Exit Diagnostics</h4><table><tr><th>Exit</th><th>Count</th><th>% Trades</th><th>Net P/L</th></tr><tr><td>TP</td><td>{{bt_result.tp_count}}</td><td>{{bt_result.tp_pct}}%</td><td>$ {{bt_result.tp_net}}</td></tr><tr><td>SL</td><td>{{bt_result.sl_count}}</td><td>{{bt_result.sl_pct}}%</td><td>$ {{bt_result.sl_net}}</td></tr><tr><td>END</td><td>{{bt_result.end_count}}</td><td>{{bt_result.end_pct}}%</td><td>$ {{bt_result.end_net}}</td></tr></table><h4>Side Diagnostics</h4><table><tr><th>Side</th><th>Trades</th><th>Net P/L</th></tr><tr><td>LONG</td><td>{{bt_result.long_count}}</td><td>$ {{bt_result.long_net}}</td></tr><tr><td>SHORT</td><td>{{bt_result.short_count}}</td><td>$ {{bt_result.short_net}}</td></tr></table>{% endif %}</div><h3>Open Positions</h3><table><tr><th>Pair</th><th>Side</th><th>Entry</th><th>$ Notional</th><th>Bars</th></tr>{% for p in positions %}<tr><td>{{p.symbol}}</td><td>{{p.side}}</td><td>{{'%.8f'|format(p.entry_price)}}</td><td>{{'%.2f'|format(p.notional)}}</td><td>{{p.bars_held}}</td></tr>{% else %}<tr><td colspan=5>None</td></tr>{% endfor %}</table><h3>Latest Trades</h3><table><tr><th>Pair</th><th>Exit</th><th>P/L</th><th>Return</th></tr>{% for t in trades %}<tr><td>{{t.symbol}}</td><td>{{t.reason}}</td><td>$ {{'%.4f'|format(t.net_pl)}}</td><td>{{'%.3f'|format(t.return_pct)}}%</td></tr>{% else %}<tr><td colspan=4>No trades yet</td></tr>{% endfor %}</table><form method=post action=/reset_demo><p><button>Reset Live Demo</button></p></form>'''
 
 @app.route('/')
 def dashboard():
