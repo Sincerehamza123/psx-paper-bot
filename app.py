@@ -20,6 +20,7 @@ EMA_FAST=9; EMA_MID=20; EMA_TREND=50
 RSI_PERIOD=14; RSI_MIN=52.0; RSI_MAX=68.0
 VOLUME_LOOKBACK=20; VOLUME_MULTIPLIER=1.50
 MIN_BODY_PCT=0.08
+EMA50_MIN_DISTANCE_PCT=0.015  # Close must be at least 1.5% above EMA50
 COOLDOWN_BARS=15
 TAKE_PROFIT_PCT=0.0040
 STOP_LOSS_PCT=0.0020
@@ -100,13 +101,16 @@ def rsi(vals,p=14):
     return out
 
 def signal_on_last_bar(cs):
-    if len(cs)<60: return False
-    closes=[x['close'] for x in cs]; vols=[x['volume'] for x in cs]; e9=ema(closes,9); e20=ema(closes,20); e50=ema(closes,50); rs=rsi(closes,14); last=cs[-1]
-    prev20=vols[-21:-1]; avg=sum(prev20)/len(prev20) if prev20 else 0
-    dt=datetime.fromtimestamp(last['close_time_ms']/1000,tz=timezone.utc); day0=datetime(dt.year,dt.month,dt.day,tzinfo=timezone.utc).timestamp()*1000
-    day=[x for x in cs if x['open_time_ms']>=day0]; vv=sum(x['volume'] for x in day); pv=sum(((x['high']+x['low']+x['close'])/3)*x['volume'] for x in day); vwap=pv/vv if vv else last['close']
-    body=abs(last['close']-last['open'])/last['open']*100 if last['open'] else 0
-    return e9[-1]>e20[-1]>e50[-1] and last['close']>=e50[-1]*(1+EMA50_MIN_DISTANCE_PCT) and last['close']>vwap and last['close']>e9[-1] and RSI_MIN<=rs[-1]<=RSI_MAX and avg>0 and last['volume']>=VOLUME_MULTIPLIER*avg and body>=MIN_BODY_PCT and last['close']>last['open']
+    # Pure EMA50 mean-reversion:
+    # +1.50% above EMA50 = SHORT, -1.50% below EMA50 = LONG.
+    # EMA9, VWAP, RSI, volume and candle-body filters are not used.
+    if len(cs)<55: return None
+    closes=[x['close'] for x in cs]
+    e50=ema(closes,50)
+    last=cs[-1]
+    if last['close'] >= e50[-1]*1.015: return 'SHORT'
+    if last['close'] <= e50[-1]*0.985: return 'LONG'
+    return None
 
 def fetch_klines(symbol,limit=180):
     pid=COINBASE_SYMBOL_MAP.get(symbol)
@@ -126,17 +130,21 @@ def set_cooldown(s,symbol,t):
     if r: r.until_close_time_ms=until
     else: s.add(Cooldown(symbol=symbol,until_close_time_ms=until))
 
-def open_position(s,symbol,c):
+def open_position(s,symbol,c,side):
     if s.get(Position,symbol): return
     if (s.scalar(select(func.count()).select_from(Position)) or 0)>=MAX_OPEN_POSITIONS: return
     cd=s.get(Cooldown,symbol)
     if cd and c['close_time_ms']<=cd.until_close_time_ms: return
-    n=current_cash(s)*POSITION_PCT; raw=c['close']; entry=raw*(1+SLIPPAGE_PCT_PER_SIDE)
-    s.add(Position(symbol=symbol,entry_time=datetime.fromtimestamp(c['close_time_ms']/1000,tz=timezone.utc).isoformat(),entry_close_time_ms=c['close_time_ms'],raw_entry_price=raw,entry_price=entry,notional=n,bars_held=0))
+    n=current_cash(s)*POSITION_PCT; raw=c['close']
+    entry=raw*(1+SLIPPAGE_PCT_PER_SIDE) if side=='LONG' else raw*(1-SLIPPAGE_PCT_PER_SIDE)
+    s.add(Position(symbol=symbol,side=side,entry_time=datetime.fromtimestamp(c['close_time_ms']/1000,tz=timezone.utc).isoformat(),entry_close_time_ms=c['close_time_ms'],raw_entry_price=raw,entry_price=entry,notional=n,bars_held=0))
 
 def close_position(s,pos,c,raw_exit,reason):
-    entry=pos.entry_price; n=pos.notional; exitp=float(raw_exit)*(1-SLIPPAGE_PCT_PER_SIDE); gr=(exitp-entry)/entry; gross=n*gr; fee=n*COMMISSION_PCT_PER_SIDE+max(0,n*(1+gr))*COMMISSION_PCT_PER_SIDE; net=gross-fee
-    s.add(Trade(symbol=pos.symbol,entry_time=pos.entry_time,exit_time=datetime.fromtimestamp(c['close_time_ms']/1000,tz=timezone.utc).isoformat(),raw_entry_price=pos.raw_entry_price,entry_price=entry,raw_exit_price=float(raw_exit),exit_price=exitp,notional=n,gross_pl=gross,commission=fee,net_pl=net,return_pct=(net/n)*100 if n else 0,reason=reason)); set_cash(s,current_cash(s)+net); set_cooldown(s,pos.symbol,c['close_time_ms']); s.delete(pos)
+    side=getattr(pos,'side','LONG') or 'LONG'; entry=pos.entry_price; n=pos.notional
+    exitp=float(raw_exit)*(1-SLIPPAGE_PCT_PER_SIDE) if side=='LONG' else float(raw_exit)*(1+SLIPPAGE_PCT_PER_SIDE)
+    gr=(exitp-entry)/entry if side=='LONG' else (entry-exitp)/entry
+    gross=n*gr; fee=n*COMMISSION_PCT_PER_SIDE+max(0,n*(1+gr))*COMMISSION_PCT_PER_SIDE; net=gross-fee
+    s.add(Trade(symbol=pos.symbol,entry_time=pos.entry_time,exit_time=datetime.fromtimestamp(c['close_time_ms']/1000,tz=timezone.utc).isoformat(),raw_entry_price=pos.raw_entry_price,entry_price=entry,raw_exit_price=float(raw_exit),exit_price=exitp,notional=n,gross_pl=gross,commission=fee,net_pl=net,return_pct=(net/n)*100 if n else 0,reason=side+' '+reason)); set_cash(s,current_cash(s)+net); set_cooldown(s,pos.symbol,c['close_time_ms']); s.delete(pos)
 
 def process_symbol(symbol):
     cs=fetch_klines(symbol); last=cs[-1] if cs else None
@@ -145,11 +153,20 @@ def process_symbol(symbol):
         if s.get(ProcessedBar,{'symbol':symbol,'close_time_ms':last['close_time_ms']}): return
         pos=s.get(Position,symbol)
         if pos and last['close_time_ms']>pos.entry_close_time_ms:
-            pos.bars_held+=1; tp=pos.entry_price*(1+TAKE_PROFIT_PCT); sl=pos.entry_price*(1-STOP_LOSS_PCT)
-            if last['low']<=sl: close_position(s,pos,last,sl,'SL')
-            elif last['high']>=tp: close_position(s,pos,last,tp,'TP')
-            elif pos.bars_held>=MAX_HOLD_BARS: close_position(s,pos,last,last['close'],'TIME')
-        if not s.get(Position,symbol) and signal_on_last_bar(cs): open_position(s,symbol,last)
+            pos.bars_held+=1; side=getattr(pos,'side','LONG') or 'LONG'
+            if side=='LONG':
+                tp=pos.entry_price*(1+TAKE_PROFIT_PCT); sl=pos.entry_price*(1-STOP_LOSS_PCT)
+                if last['low']<=sl: close_position(s,pos,last,sl,'SL')
+                elif last['high']>=tp: close_position(s,pos,last,tp,'TP')
+                elif pos.bars_held>=MAX_HOLD_BARS: close_position(s,pos,last,last['close'],'TIME')
+            else:
+                tp=pos.entry_price*(1-TAKE_PROFIT_PCT); sl=pos.entry_price*(1+STOP_LOSS_PCT)
+                if last['high']>=sl: close_position(s,pos,last,sl,'SL')
+                elif last['low']<=tp: close_position(s,pos,last,tp,'TP')
+                elif pos.bars_held>=MAX_HOLD_BARS: close_position(s,pos,last,last['close'],'TIME')
+        if not s.get(Position,symbol):
+            side=signal_on_last_bar(cs)
+            if side: open_position(s,symbol,last,side)
         s.add(ProcessedBar(symbol=symbol,close_time_ms=last['close_time_ms'])); s.commit()
 
 def worker_loop():
@@ -188,11 +205,11 @@ def fetch_historical_day(symbol,day_start,range_start,range_end):
 def run_backtest_30d():
     global _backtest_running
     try:
-        set_state('bt_status','running'); set_state('bt_progress','0'); set_state('bt_message','Starting Strategy V2.1 EMA50+1.5% backtest...'); set_state('bt_result','')
+        set_state('bt_status','running'); set_state('bt_progress','0'); set_state('bt_message','Starting EMA50 Mean-Reversion backtest...'); set_state('bt_result','')
         end_dt=datetime.now(timezone.utc).replace(second=0,microsecond=0); start_dt=end_dt-timedelta(days=30); capital=STARTING_CAPITAL; hist={s:[] for s in SYMBOLS}; pos={}; cooldown={}; lastc={}; unavailable=set(); st={'trades':0,'wins':0,'losses':0,'gross':0.0,'costs':0.0,'net':0.0,'tp_count':0,'sl_count':0,'time_count':0,'end_count':0,'tp_net':0.0,'sl_net':0.0,'time_net':0.0,'end_net':0.0}
         def close_bt(sym,c,raw,reason):
             nonlocal capital
-            p=pos.pop(sym); entry=p['entry']; n=p['notional']; exitp=float(raw)*(1-SLIPPAGE_PCT_PER_SIDE); gr=(exitp-entry)/entry; gross=n*gr; fee=n*COMMISSION_PCT_PER_SIDE+max(0,n*(1+gr))*COMMISSION_PCT_PER_SIDE; net=gross-fee; capital+=net; cooldown[sym]=c['close_time_ms']+COOLDOWN_BARS*60000; st['trades']+=1; st['gross']+=gross; st['costs']+=fee; st['net']+=net
+            p=pos.pop(sym); entry=p['entry']; n=p['notional']; side=p.get('side','LONG'); exitp=float(raw)*(1-SLIPPAGE_PCT_PER_SIDE) if side=='LONG' else float(raw)*(1+SLIPPAGE_PCT_PER_SIDE); gr=(exitp-entry)/entry if side=='LONG' else (entry-exitp)/entry; gross=n*gr; fee=n*COMMISSION_PCT_PER_SIDE+max(0,n*(1+gr))*COMMISSION_PCT_PER_SIDE; net=gross-fee; capital+=net; cooldown[sym]=c['close_time_ms']+COOLDOWN_BARS*60000; st['trades']+=1; st['gross']+=gross; st['costs']+=fee; st['net']+=net
             if reason=='TP': st['tp_count']+=1; st['tp_net']+=net
             elif reason=='SL': st['sl_count']+=1; st['sl_net']+=net
             elif reason=='TIME': st['time_count']+=1; st['time_net']+=net
@@ -215,17 +232,27 @@ def run_backtest_30d():
                 if len(h)>180: del h[:-180]
                 p=pos.get(sym)
                 if p and c['close_time_ms']>p['t']:
-                    p['bars']+=1; tp=p['entry']*(1+TAKE_PROFIT_PCT); sl=p['entry']*(1-STOP_LOSS_PCT)
-                    if c['low']<=sl: close_bt(sym,c,sl,'SL')
-                    elif c['high']>=tp: close_bt(sym,c,tp,'TP')
-                    elif p['bars']>=MAX_HOLD_BARS: close_bt(sym,c,c['close'],'TIME')
-                if sym not in pos and len(pos)<MAX_OPEN_POSITIONS and len(h)>=60 and c['close_time_ms']>cooldown.get(sym,0) and signal_on_last_bar(h):
-                    pos[sym]={'t':c['close_time_ms'],'entry':c['close']*(1+SLIPPAGE_PCT_PER_SIDE),'notional':capital*POSITION_PCT,'bars':0}
-            pct=min(99,int(((ds-start_dt).total_seconds()/(end_dt-start_dt).total_seconds())*100)+3); set_state('bt_progress',pct); set_state('bt_message',f"V2 through {ds.date()} • trades {st['trades']} • capital ${capital:.2f}")
+                    p['bars']+=1; side=p.get('side','LONG')
+                    if side=='LONG':
+                        tp=p['entry']*(1+TAKE_PROFIT_PCT); sl=p['entry']*(1-STOP_LOSS_PCT)
+                        if c['low']<=sl: close_bt(sym,c,sl,'SL')
+                        elif c['high']>=tp: close_bt(sym,c,tp,'TP')
+                        elif p['bars']>=MAX_HOLD_BARS: close_bt(sym,c,c['close'],'TIME')
+                    else:
+                        tp=p['entry']*(1-TAKE_PROFIT_PCT); sl=p['entry']*(1+STOP_LOSS_PCT)
+                        if c['high']>=sl: close_bt(sym,c,sl,'SL')
+                        elif c['low']<=tp: close_bt(sym,c,tp,'TP')
+                        elif p['bars']>=MAX_HOLD_BARS: close_bt(sym,c,c['close'],'TIME')
+                if sym not in pos and len(pos)<MAX_OPEN_POSITIONS and len(h)>=55 and c['close_time_ms']>cooldown.get(sym,0):
+                    side=signal_on_last_bar(h)
+                    if side:
+                        entry=c['close']*(1+SLIPPAGE_PCT_PER_SIDE) if side=='LONG' else c['close']*(1-SLIPPAGE_PCT_PER_SIDE)
+                        pos[sym]={'t':c['close_time_ms'],'entry':entry,'notional':capital*POSITION_PCT,'bars':0,'side':side}
+            pct=min(99,int(((ds-start_dt).total_seconds()/(end_dt-start_dt).total_seconds())*100)+3); set_state('bt_progress',pct); set_state('bt_message',f"EMA50 V3 through {ds.date()} • trades {st['trades']} • capital ${capital:.2f}")
         for sym in list(pos):
             if sym in lastc: close_bt(sym,lastc[sym],lastc[sym]['close'],'END')
-        t=st['trades']; w=st['wins']; result={'strategy':'V2 Trend+RSI+Volume+Cooldown','days':30,'pairs_requested':len(SYMBOLS),'pairs_used':len(SYMBOLS)-len(unavailable),'trades':t,'wins':w,'losses':st['losses'],'win_rate':round((w/t*100) if t else 0,2),'gross_pl':round(st['gross'],4),'costs':round(st['costs'],4),'net_pl':round(st['net'],4),'starting_capital':STARTING_CAPITAL,'final_capital':round(capital,4),'return_pct':round((capital/STARTING_CAPITAL-1)*100,3),'tp_count':st['tp_count'],'sl_count':st['sl_count'],'time_count':st['time_count'],'tp_net':round(st['tp_net'],4),'sl_net':round(st['sl_net'],4),'time_net':round(st['time_net'],4),'tp_pct':round((st['tp_count']/t*100) if t else 0,2),'sl_pct':round((st['sl_count']/t*100) if t else 0,2),'time_pct':round((st['time_count']/t*100) if t else 0,2)}
-        set_state('bt_result',json.dumps(result)); set_state('bt_progress','100'); set_state('bt_message','Strategy V2.1 EMA50+1.5% 30-day backtest completed.'); set_state('bt_status','completed')
+        t=st['trades']; w=st['wins']; result={'strategy':'EMA50 Mean Reversion ±1.50%','days':30,'pairs_requested':len(SYMBOLS),'pairs_used':len(SYMBOLS)-len(unavailable),'trades':t,'wins':w,'losses':st['losses'],'win_rate':round((w/t*100) if t else 0,2),'gross_pl':round(st['gross'],4),'costs':round(st['costs'],4),'net_pl':round(st['net'],4),'starting_capital':STARTING_CAPITAL,'final_capital':round(capital,4),'return_pct':round((capital/STARTING_CAPITAL-1)*100,3),'tp_count':st['tp_count'],'sl_count':st['sl_count'],'time_count':st['time_count'],'tp_net':round(st['tp_net'],4),'sl_net':round(st['sl_net'],4),'time_net':round(st['time_net'],4),'tp_pct':round((st['tp_count']/t*100) if t else 0,2),'sl_pct':round((st['sl_count']/t*100) if t else 0,2),'time_pct':round((st['time_count']/t*100) if t else 0,2)}
+        set_state('bt_result',json.dumps(result)); set_state('bt_progress','100'); set_state('bt_message','EMA50 Mean-Reversion 30-day backtest completed.'); set_state('bt_status','completed')
     except Exception as e:
         set_state('bt_status','error'); set_state('bt_message',type(e).__name__+': '+str(e)); print('[backtest] fatal',e,flush=True)
     finally:
@@ -257,7 +284,7 @@ def start_backtest():
         _backtest_running=True; threading.Thread(target=run_backtest_30d,daemon=True).start()
     return redirect(url_for('dashboard'))
 
-HTML='''<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="20"><style>body{font-family:Arial;background:#10131a;color:#eee;padding:14px;max-width:1100px;margin:auto}.g{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px}.c,.n,.bt{background:#1b202b;padding:13px;border-radius:12px}.l{font-size:12px;color:#aaa}.v{font-size:22px;font-weight:700}table{width:100%;border-collapse:collapse;background:#1b202b;margin-top:12px}td,th{padding:8px;border-bottom:1px solid #333;font-size:12px;text-align:left}.n,.bt{margin:14px 0}.ok{color:#78d98b}.bad{color:#ff9c9c}button{background:#fff;color:#111;border:0;border-radius:8px;padding:10px 14px;font-weight:700}.p{height:10px;background:#303746;border-radius:8px;overflow:hidden;margin:8px 0}.pb{height:100%;background:#ddd}.small{color:#aaa;font-size:12px}</style><h2>Crypto 1m Automatic Paper Bot — Strategy V2.1</h2><p>Coinbase public 1m data • No API key • No real orders • 20 pairs</p><div class=n><b>Storage:</b> {% if persistent %}<span class=ok>Persistent database connected ✅</span>{% else %}<span class=bad>Temporary SQLite ⚠️ — restart/redeploy can erase history</span>{% endif %}</div><div class=g>{% for k,v in cards %}<div class=c><div class=l>{{k}}</div><div class=v>{{v}}</div></div>{% endfor %}</div><div class=n><b>Strategy V2:</b> EMA9 &gt; EMA20 &gt; EMA50, close at least 1.5% above EMA50, close above VWAP & EMA9, RSI(14) 52–68, volume ≥1.5× 20-bar average, green candle body ≥0.08%, 15-minute cooldown.<br><b>Exit:</b> TP +0.40%, SL -0.20%, max hold 15 bars.<br><b>Risk:</b> max 5 open positions, 10% capital/trade.<br><b>Costs:</b> fee 0.05%/side + slippage 0.01%/side.</div><div class=bt><h3>30-Day Backtest — V2.1</h3>{% if bt_status=='running' %}<b>Running: {{bt_progress}}%</b><div class=p><div class=pb style="width:{{bt_progress}}%"></div></div><div class=small>{{bt_message}}</div>{% else %}<form method=post action=/backtest/start><button>Run 30-Day Backtest</button></form>{% if bt_message %}<p class=small>{{bt_message}}</p>{% endif %}{% endif %}{% if bt_result %}<div class=g><div class=c><div class=l>BT Trades</div><div class=v>{{bt_result.trades}}</div></div><div class=c><div class=l>BT Win Rate</div><div class=v>{{bt_result.win_rate}}%</div></div><div class=c><div class=l>BT Net P/L</div><div class=v>$ {{bt_result.net_pl}}</div></div><div class=c><div class=l>BT Final Capital</div><div class=v>$ {{bt_result.final_capital}}</div></div><div class=c><div class=l>BT Return</div><div class=v>{{bt_result.return_pct}}%</div></div></div><h4>Exit Diagnostics</h4><table><tr><th>Exit</th><th>Count</th><th>% Trades</th><th>Net P/L</th></tr><tr><td>TP</td><td>{{bt_result.tp_count}}</td><td>{{bt_result.tp_pct}}%</td><td>$ {{bt_result.tp_net}}</td></tr><tr><td>SL</td><td>{{bt_result.sl_count}}</td><td>{{bt_result.sl_pct}}%</td><td>$ {{bt_result.sl_net}}</td></tr><tr><td>TIME</td><td>{{bt_result.time_count}}</td><td>{{bt_result.time_pct}}%</td><td>$ {{bt_result.time_net}}</td></tr></table>{% endif %}</div><h3>Open Positions</h3><table><tr><th>Pair</th><th>Entry</th><th>$ Notional</th><th>Bars</th></tr>{% for p in positions %}<tr><td>{{p.symbol}}</td><td>{{'%.8f'|format(p.entry_price)}}</td><td>{{'%.2f'|format(p.notional)}}</td><td>{{p.bars_held}}</td></tr>{% else %}<tr><td colspan=4>None</td></tr>{% endfor %}</table><h3>Latest Trades</h3><table><tr><th>Pair</th><th>Exit</th><th>P/L</th><th>Return</th></tr>{% for t in trades %}<tr><td>{{t.symbol}}</td><td>{{t.reason}}</td><td>$ {{'%.4f'|format(t.net_pl)}}</td><td>{{'%.3f'|format(t.return_pct)}}%</td></tr>{% else %}<tr><td colspan=4>No trades yet</td></tr>{% endfor %}</table><form method=post action=/reset_demo><p><button>Reset Live Demo</button></p></form>'''
+HTML='''<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="20"><style>body{font-family:Arial;background:#10131a;color:#eee;padding:14px;max-width:1100px;margin:auto}.g{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px}.c,.n,.bt{background:#1b202b;padding:13px;border-radius:12px}.l{font-size:12px;color:#aaa}.v{font-size:22px;font-weight:700}table{width:100%;border-collapse:collapse;background:#1b202b;margin-top:12px}td,th{padding:8px;border-bottom:1px solid #333;font-size:12px;text-align:left}.n,.bt{margin:14px 0}.ok{color:#78d98b}.bad{color:#ff9c9c}button{background:#fff;color:#111;border:0;border-radius:8px;padding:10px 14px;font-weight:700}.p{height:10px;background:#303746;border-radius:8px;overflow:hidden;margin:8px 0}.pb{height:100%;background:#ddd}.small{color:#aaa;font-size:12px}</style><h2>Crypto 1m Automatic Paper Bot — EMA50 Mean Reversion</h2><p>Coinbase public 1m data • No API key • No real orders • 20 pairs</p><div class=n><b>Storage:</b> {% if persistent %}<span class=ok>Persistent database connected ✅</span>{% else %}<span class=bad>Temporary SQLite ⚠️ — restart/redeploy can erase history</span>{% endif %}</div><div class=g>{% for k,v in cards %}<div class=c><div class=l>{{k}}</div><div class=v>{{v}}</div></div>{% endfor %}</div><div class=n><b>Strategy:</b> EMA50 Mean Reversion only.<br><b>SHORT:</b> price ≥1.50% above EMA50.<br><b>LONG:</b> price ≥1.50% below EMA50.<br><b>No entry filters:</b> EMA9, VWAP, RSI and volume removed.<br><b>Exit:</b> TP +0.40%, SL -0.20%, max hold 15 bars.<br><b>Risk:</b> max 5 open positions, 10% capital/trade.<br><b>Costs:</b> fee 0.05%/side + slippage 0.01%/side.</div><div class=bt><h3>30-Day Backtest — EMA50 V3</h3>{% if bt_status=='running' %}<b>Running: {{bt_progress}}%</b><div class=p><div class=pb style="width:{{bt_progress}}%"></div></div><div class=small>{{bt_message}}</div>{% else %}<form method=post action=/backtest/start><button>Run 30-Day Backtest</button></form>{% if bt_message %}<p class=small>{{bt_message}}</p>{% endif %}{% endif %}{% if bt_result %}<div class=g><div class=c><div class=l>BT Trades</div><div class=v>{{bt_result.trades}}</div></div><div class=c><div class=l>BT Win Rate</div><div class=v>{{bt_result.win_rate}}%</div></div><div class=c><div class=l>BT Net P/L</div><div class=v>$ {{bt_result.net_pl}}</div></div><div class=c><div class=l>BT Final Capital</div><div class=v>$ {{bt_result.final_capital}}</div></div><div class=c><div class=l>BT Return</div><div class=v>{{bt_result.return_pct}}%</div></div></div><h4>Exit Diagnostics</h4><table><tr><th>Exit</th><th>Count</th><th>% Trades</th><th>Net P/L</th></tr><tr><td>TP</td><td>{{bt_result.tp_count}}</td><td>{{bt_result.tp_pct}}%</td><td>$ {{bt_result.tp_net}}</td></tr><tr><td>SL</td><td>{{bt_result.sl_count}}</td><td>{{bt_result.sl_pct}}%</td><td>$ {{bt_result.sl_net}}</td></tr><tr><td>TIME</td><td>{{bt_result.time_count}}</td><td>{{bt_result.time_pct}}%</td><td>$ {{bt_result.time_net}}</td></tr></table>{% endif %}</div><h3>Open Positions</h3><table><tr><th>Pair</th><th>Entry</th><th>$ Notional</th><th>Bars</th></tr>{% for p in positions %}<tr><td>{{p.symbol}}</td><td>{{'%.8f'|format(p.entry_price)}}</td><td>{{'%.2f'|format(p.notional)}}</td><td>{{p.bars_held}}</td></tr>{% else %}<tr><td colspan=4>None</td></tr>{% endfor %}</table><h3>Latest Trades</h3><table><tr><th>Pair</th><th>Exit</th><th>P/L</th><th>Return</th></tr>{% for t in trades %}<tr><td>{{t.symbol}}</td><td>{{t.reason}}</td><td>$ {{'%.4f'|format(t.net_pl)}}</td><td>{{'%.3f'|format(t.return_pct)}}%</td></tr>{% else %}<tr><td colspan=4>No trades yet</td></tr>{% endfor %}</table><form method=post action=/reset_demo><p><button>Reset Live Demo</button></p></form>'''
 
 @app.route('/')
 def dashboard():
