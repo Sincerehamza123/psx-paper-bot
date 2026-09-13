@@ -166,10 +166,12 @@ def build_live_candidates(top25):
         iid = x["instId"]
         try:
             comp = [b for b in fetch_daily_recent(iid, 6) if b["confirm"] == "1"]
-            if len(comp) < 2:
+            if len(comp) < 3:
                 continue
-            d1, d2 = comp[-2], comp[-1]
-            if not (d1["c"] > d1["o"] and d2["c"] > d2["o"] and d2["c"] > d1["h"]):
+            d0, d1, d2 = comp[-3], comp[-2], comp[-1]
+            # Start-of-run rule: RED -> Green #1 -> Green #2 only.
+            # Later G-G pairs inside a longer green streak are invalid.
+            if not (d0["c"] < d0["o"] and d1["c"] > d1["o"] and d2["c"] > d2["o"]):
                 continue
             tk = tmap.get(iid, {})
             last = fnum(tk.get("last"))
@@ -290,28 +292,31 @@ def do_backtest(days):
         trades = []
         balance = START_BALANCE
 
-        for di in range(2, len(all_dates)):
+        for di in range(3, len(all_dates)):
             d3_ts = all_dates[di]
             d2_ts = all_dates[di - 1]
             d1_ts = all_dates[di - 2]
+            d0_ts = all_dates[di - 3]
 
             ranking = []
             for iid, mp in hist.items():
-                if not all(x in mp for x in (d1_ts, d2_ts, d3_ts)):
+                if not all(x in mp for x in (d0_ts, d1_ts, d2_ts, d3_ts)):
                     continue
-                d1, d2, d3 = mp[d1_ts], mp[d2_ts], mp[d3_ts]
+                d0, d1, d2, d3 = mp[d0_ts], mp[d1_ts], mp[d2_ts], mp[d3_ts]
                 if d1["quote_vol"] <= 0 or d2["quote_vol"] < MIN_DAILY_QUOTE_VOL:
                     continue
                 upside = (d2["quote_vol"] / d1["quote_vol"] - 1.0) * 100.0
-                ranking.append((upside, iid, d1, d2, d3))
+                ranking.append((upside, iid, d0, d1, d2, d3))
 
             ranking.sort(key=lambda z: z[0], reverse=True)
             top25 = ranking[:TOP_N]
             candidates = []
 
             for rank, item in enumerate(top25, 1):
-                upside, iid, d1, d2, d3 = item
-                setup = d1["c"] > d1["o"] and d2["c"] > d2["o"] and d2["c"] > d1["h"]
+                upside, iid, d0, d1, d2, d3 = item
+                # Only the first two greens of a new green run are valid:
+                # D0 red -> D1 green #1 -> D2 green #2.
+                setup = d0["c"] < d0["o"] and d1["c"] > d1["o"] and d2["c"] > d2["o"]
                 if not setup or d3["h"] <= d2["h"]:
                     continue
                 entry = max(d2["h"], d3["o"])
@@ -433,7 +438,7 @@ HTML = '''<!doctype html><html><head><meta name="viewport" content="width=device
 <style>
 body{margin:0;background:#071019;color:#eef6ff;font-family:Arial;padding:14px}.w{max-width:1200px;margin:auto}.c{background:#111d29;border:1px solid #27394b;border-radius:14px;padding:14px;margin-bottom:12px}h2,h3{margin-top:0}.sub{color:#a8bacb;font-size:13px;line-height:1.55}.grid{display:grid;grid-template-columns:repeat(5,1fr);gap:8px}.k{background:#09141e;padding:10px;border-radius:9px}.v{font-size:20px;font-weight:bold}.g{color:#6ff0a0}.r{color:#ff9999}.y{color:#ffd479}.tabs{display:flex;gap:8px;margin-bottom:12px}.tab{padding:10px 14px;border-radius:9px;background:#142536;cursor:pointer}.tab.on{background:#387df3}.pane{display:none}.pane.on{display:block}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:8px;border-bottom:1px solid #253645;text-align:right;white-space:nowrap}th:first-child,td:first-child{text-align:left}.scroll{overflow:auto}button{padding:10px 14px;border:0;border-radius:8px;background:#387df3;color:#fff;font-weight:bold;cursor:pointer}input{background:#09141e;color:#fff;border:1px solid #33485a;border-radius:8px;padding:9px;width:90px}@media(max-width:700px){.grid{grid-template-columns:1fr 1fr}}
 </style></head><body><div class="w">
-<div class="c"><h2>Top-25 Volume Upside + 3-Candle Breakout</h2><div class="sub">PAPER ONLY — $100 margin × 5x = $500 trade. Previous completed day ke Volume Upside ranking se Top-25 coins. D1 Green + D2 Green + D2 Close &gt; D1 High. D3 par D2 High break ho to signal. Multiple signals mein highest-ranked coin trade hota hai. TP +20%, warna day-end exit.</div></div>
+<div class="c"><h2>Top-25 Volume Upside + 3-Candle Breakout</h2><div class="sub">PAPER ONLY — $100 margin × 5x = $500 trade. Previous completed day ke Volume Upside ranking se Top-25 coins. D0 Red ke baad Green #1 + Green #2. D3 par Green #2 ka High break ho to signal. Long green streak ke beech ka G-G pair valid nahi. Multiple signals mein highest-ranked coin trade hota hai. TP +20%, warna day-end exit.</div></div>
 <div class="c grid"><div class="k"><div class="sub">Start Balance</div><div class="v">$100</div></div><div class="k"><div class="sub">Margin</div><div class="v">$100</div></div><div class="k"><div class="sub">Leverage</div><div class="v">5x</div></div><div class="k"><div class="sub">Trade Size</div><div class="v">$500</div></div><div class="k"><div class="sub">TP</div><div class="v">20%</div></div></div>
 <div class="tabs"><div id="tLive" class="tab on" onclick="showTab('live')">LIVE PAPER</div><div id="tBt" class="tab" onclick="showTab('bt')">BACKTEST</div></div>
 <div id="live" class="pane on"><div class="c"><button onclick="scanNow()">Scan Now</button> <span id="liveMsg" class="sub"></span><div id="pos" style="margin-top:12px"></div></div>
