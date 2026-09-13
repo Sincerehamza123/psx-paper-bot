@@ -1,234 +1,61 @@
-import json, os
-from datetime import datetime, timezone
+import json,os
+from datetime import datetime,timezone
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
-from flask import Flask, jsonify, request, Response
-
-app = Flask(__name__)
-
-PAIRS = {
-    "BTC":  {"coinbase": "BTC-USD",  "kraken": "XBTUSD"},
-    "ETH":  {"coinbase": "ETH-USD",  "kraken": "ETHUSD"},
-    "SOL":  {"coinbase": "SOL-USD",  "kraken": "SOLUSD"},
-    "XRP":  {"coinbase": "XRP-USD",  "kraken": "XRPUSD"},
-    "ADA":  {"coinbase": "ADA-USD",  "kraken": "ADAUSD"},
-    "DOGE": {"coinbase": "DOGE-USD", "kraken": "DOGEUSD"},
-    "LTC":  {"coinbase": "LTC-USD",  "kraken": "LTCUSD"},
-}
-
-DEFAULTS = {
-    "capital": 100.0,
-    "coinbase_fee_pct": 0.60,
-    "kraken_fee_pct": 0.40,
-    "slippage_pct_each_side": 0.05,
-    "min_net_profit_pct": 0.20,
-}
-
-def get_json(url, timeout=12):
-    req = Request(url, headers={
-        "User-Agent": "Mozilla/5.0 Paper-Arbitrage-Scanner",
-        "Accept": "application/json",
-        "Cache-Control": "no-cache",
-    })
-    with urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode("utf-8"))
-
-def coinbase_quote(product):
-    d = get_json(f"https://api.exchange.coinbase.com/products/{product}/ticker")
-    return {"bid": float(d["bid"]), "ask": float(d["ask"]), "last": float(d["price"])}
-
-def kraken_quote(pair):
-    d = get_json("https://api.kraken.com/0/public/Ticker?" + urlencode({"pair": pair}))
-    if d.get("error"):
-        raise RuntimeError("; ".join(d["error"]))
-    result = d["result"]
-    if not result:
-        raise RuntimeError("No Kraken ticker result")
-    x = next(iter(result.values()))
-    return {"ask": float(x["a"][0]), "bid": float(x["b"][0]), "last": float(x["c"][0])}
-
-def calc_direction(buy_exchange, buy_ask, sell_exchange, sell_bid, capital, fees, slip):
-    buy_fee = fees[buy_exchange] / 100.0
-    sell_fee = fees[sell_exchange] / 100.0
-    s = slip / 100.0
-
-    buy_exec = buy_ask * (1 + s)
-    sell_exec = sell_bid * (1 - s)
-    gross_spread_pct = (sell_bid / buy_ask - 1) * 100.0
-
-    qty = capital / (buy_exec * (1 + buy_fee))
-    sell_net = qty * sell_exec * (1 - sell_fee)
-    profit = sell_net - capital
-    net_pct = profit / capital * 100.0 if capital else 0.0
-
-    return {
-        "buy_exchange": buy_exchange,
-        "sell_exchange": sell_exchange,
-        "buy_ask": buy_ask,
-        "sell_bid": sell_bid,
-        "gross_spread_pct": gross_spread_pct,
-        "net_profit_pct": net_pct,
-        "profit_usd": profit,
-    }
-
+from urllib.request import Request,urlopen
+from flask import Flask,jsonify,request,Response
+app=Flask(__name__)
+COINS="BTC ETH SOL XRP ADA DOGE LTC AVAX LINK SUI DOT TRX BCH NEAR APT".split()
+def get(u):
+ r=Request(u,headers={"User-Agent":"Mozilla/5.0","Accept":"application/json"})
+ with urlopen(r,timeout=10) as x:return json.loads(x.read().decode())
+def OKX():
+ d=get("https://openapi.okx.com/api/v5/market/tickers?instType=SPOT");o={}
+ for x in d.get("data",[]):
+  s=x.get("instId","")
+  if s.endswith("-USDT") and s[:-5] in COINS and x.get("bidPx") and x.get("askPx"):o[s[:-5]]=(float(x["bidPx"]),float(x["askPx"]))
+ return o
+def Bybit():
+ d=get("https://api.bybit.com/v5/market/tickers?category=spot");o={};w={c+"USDT":c for c in COINS}
+ for x in d.get("result",{}).get("list",[]):
+  s=x.get("symbol","")
+  if s in w and x.get("bid1Price") and x.get("ask1Price"):o[w[s]]=(float(x["bid1Price"]),float(x["ask1Price"]))
+ return o
+def Kraken():
+ o={}
+ for c in COINS:
+  try:
+   pair=("XBT" if c=="BTC" else c)+"USDT";d=get("https://api.kraken.com/0/public/Ticker?"+urlencode({"pair":pair}))
+   if not d.get("error"):
+    x=next(iter(d["result"].values()));o[c]=(float(x["b"][0]),float(x["a"][0]))
+  except:pass
+ return o
 @app.get("/api/scan")
 def scan():
-    capital = max(1.0, float(request.args.get("capital", DEFAULTS["capital"])))
-    cb_fee = max(0.0, float(request.args.get("cb_fee", DEFAULTS["coinbase_fee_pct"])))
-    kr_fee = max(0.0, float(request.args.get("kr_fee", DEFAULTS["kraken_fee_pct"])))
-    slip = max(0.0, float(request.args.get("slippage", DEFAULTS["slippage_pct_each_side"])))
-    min_net = float(request.args.get("min_net", DEFAULTS["min_net_profit_pct"]))
-
-    fees = {"Coinbase": cb_fee, "Kraken": kr_fee}
-    rows = []
-
-    for sym, ids in PAIRS.items():
-        item = {"symbol": sym, "ok": False}
-        try:
-            cb = coinbase_quote(ids["coinbase"])
-            kr = kraken_quote(ids["kraken"])
-
-            d1 = calc_direction("Coinbase", cb["ask"], "Kraken", kr["bid"], capital, fees, slip)
-            d2 = calc_direction("Kraken", kr["ask"], "Coinbase", cb["bid"], capital, fees, slip)
-            best = d1 if d1["net_profit_pct"] >= d2["net_profit_pct"] else d2
-
-            item.update({
-                "ok": True,
-                "best": best,
-                "opportunity": best["net_profit_pct"] >= min_net,
-            })
-        except Exception as e:
-            item["error"] = repr(e)
-        rows.append(item)
-
-    rows.sort(key=lambda x: x.get("best", {}).get("net_profit_pct", -999), reverse=True)
-    return jsonify({
-        "paper_only": True,
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-        "capital": capital,
-        "rows": rows,
-    })
-
+ cap=max(1,float(request.args.get("capital",100)));sl=max(0,float(request.args.get("slip",.02)))/100;thr=float(request.args.get("threshold",.05))
+ fees={"OKX":float(request.args.get("okx",.10))/100,"Bybit":float(request.args.get("bybit",.10))/100,"Kraken":float(request.args.get("kraken",.40))/100}
+ mk={};err={}
+ for n,f in [("OKX",OKX),("Bybit",Bybit),("Kraken",Kraken)]:
+  try:
+   z=f()
+   if z:mk[n]=z
+   else:err[n]="No data"
+  except Exception as e:err[n]=str(e)
+ rows=[]
+ for c in COINS:
+  best=None
+  for be,bm in mk.items():
+   if c not in bm:continue
+   for se,sm in mk.items():
+    if be==se or c not in sm:continue
+    ask=bm[c][1];bid=sm[c][0];qty=cap/(ask*(1+sl)*(1+fees[be]));out=qty*bid*(1-sl)*(1-fees[se]);pr=out-cap
+    z={"coin":c,"buy":be,"sell":se,"ask":ask,"bid":bid,"gross":(bid/ask-1)*100,"net":pr/cap*100,"profit":pr}
+    if best is None or z["net"]>best["net"]:best=z
+  if best:best["positive"]=best["net"]>=thr;rows.append(best)
+ rows.sort(key=lambda x:x["net"],reverse=True)
+ return jsonify(rows=rows,errors=err,exchanges=list(mk),paper_only=True,time=datetime.now(timezone.utc).isoformat())
 @app.get("/health")
-def health():
-    return jsonify({"ok": True, "paper_only": True})
-
-HTML = """<!doctype html>
-<html>
-<head>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Paper Crypto Arbitrage Scanner</title>
-<style>
-:root{font-family:Arial,sans-serif;color-scheme:dark}
-body{margin:0;background:#0b0f14;color:#e7edf3;padding:14px}
-.wrap{max-width:1000px;margin:auto}
-.card{background:#131a22;border:1px solid #263241;border-radius:14px;padding:14px;margin-bottom:12px}
-h2{margin:4px 0 8px}
-.note{font-size:13px;color:#aebdca;line-height:1.45}
-.controls{display:grid;grid-template-columns:repeat(5,minmax(110px,1fr));gap:8px}
-label{font-size:12px;color:#9fb0bf}
-input{width:100%;box-sizing:border-box;margin-top:4px;padding:9px;border-radius:8px;border:1px solid #344354;background:#0c1219;color:#fff}
-button{padding:11px 14px;border:0;border-radius:9px;background:#3b82f6;color:#fff;font-weight:700}
-table{width:100%;border-collapse:collapse;font-size:13px}
-th,td{padding:9px 7px;border-bottom:1px solid #25303c;text-align:right;white-space:nowrap}
-th:first-child,td:first-child{text-align:left}
-.good{background:#11351f}
-.bad{color:#aeb7c2}
-.err{color:#ff9292}
-.pill{display:inline-block;padding:3px 7px;border-radius:10px;background:#213044;font-size:11px}
-@media(max-width:760px){.controls{grid-template-columns:1fr 1fr}.tablebox{overflow-x:auto}}
-</style>
-</head>
-<body>
-<div class="wrap">
-<div class="card">
-<h2>Crypto Arbitrage — Paper Scanner</h2>
-<div class="note">
-Coinbase aur Kraken ke live best bid/ask compare karta hai. Koi real order place nahi hota aur API key nahi chahiye.
-Fees aur slippage estimate include hain. Real arbitrage mein dono exchanges par pehle se funds rakhna aam tor par zaroori hota hai.
-</div>
-</div>
-
-<div class="card">
-<div class="controls">
-<div><label>Capital $<input id="capital" type="number" value="100" min="1" step="1"></label></div>
-<div><label>Coinbase fee %<input id="cb" type="number" value="0.60" min="0" step="0.01"></label></div>
-<div><label>Kraken fee %<input id="kr" type="number" value="0.40" min="0" step="0.01"></label></div>
-<div><label>Slippage each side %<input id="slip" type="number" value="0.05" min="0" step="0.01"></label></div>
-<div><label>Alert if net >= %<input id="minnet" type="number" value="0.20" step="0.01"></label></div>
-</div>
-<div style="margin-top:10px">
-<button onclick="scan()">Scan Now</button>
-<span id="stamp" class="pill">Ready</span>
-</div>
-</div>
-
-<div class="card tablebox">
-<table>
-<thead>
-<tr>
-<th>Coin</th><th>Buy</th><th>Sell</th><th>Buy Ask</th><th>Sell Bid</th><th>Gross %</th><th>Net %</th><th>Est. $</th>
-</tr>
-</thead>
-<tbody id="body"><tr><td colspan="8">Press Scan Now</td></tr></tbody>
-</table>
-</div>
-</div>
-
-<script>
-let busy=false;
-function n(v,d=4){ return Number(v).toLocaleString(undefined,{maximumFractionDigits:d}); }
-
-async function scan(){
- if(busy) return;
- busy=true;
- document.getElementById('stamp').textContent='Scanning...';
- const q=new URLSearchParams({
-  capital:document.getElementById('capital').value,
-  cb_fee:document.getElementById('cb').value,
-  kr_fee:document.getElementById('kr').value,
-  slippage:document.getElementById('slip').value,
-  min_net:document.getElementById('minnet').value
- });
- try{
-  const r=await fetch('/api/scan?'+q.toString(),{cache:'no-store'});
-  const j=await r.json();
-  const tb=document.getElementById('body');
-  tb.innerHTML='';
-  for(const x of j.rows){
-   const tr=document.createElement('tr');
-   if(!x.ok){
-    tr.innerHTML=`<td>${x.symbol}</td><td colspan="7" class="err">${x.error||'Error'}</td>`;
-   } else {
-    if(x.opportunity) tr.className='good';
-    const b=x.best;
-    tr.innerHTML=`
-      <td><b>${x.symbol}</b></td>
-      <td>${b.buy_exchange}</td>
-      <td>${b.sell_exchange}</td>
-      <td>${n(b.buy_ask,8)}</td>
-      <td>${n(b.sell_bid,8)}</td>
-      <td>${n(b.gross_spread_pct,3)}%</td>
-      <td class="${b.net_profit_pct>0?'':'bad'}"><b>${n(b.net_profit_pct,3)}%</b></td>
-      <td>${n(b.profit_usd,3)}</td>`;
-   }
-   tb.appendChild(tr);
-  }
-  document.getElementById('stamp').textContent='Updated '+new Date().toLocaleTimeString();
- } catch(e){
-  document.getElementById('stamp').textContent='Error: '+e;
- }
- busy=false;
-}
-scan();
-setInterval(scan,15000);
-</script>
-</body>
-</html>"""
-
+def health():return jsonify(ok=True,paper_only=True)
+HTML='''<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Arbitrage Scanner</title><style>*{box-sizing:border-box}body{margin:0;padding:14px;background:#090e14;color:#edf3f8;font-family:Arial}.w{max-width:1050px;margin:auto}.c{background:#121a23;border:1px solid #283646;border-radius:15px;padding:15px;margin-bottom:12px}.g{display:grid;grid-template-columns:repeat(6,1fr);gap:8px}label{font-size:11px;color:#9fb0bf}input{width:100%;margin-top:4px;padding:9px;background:#091018;color:white;border:1px solid #34475a;border-radius:8px}button{padding:11px 16px;border:0;border-radius:9px;background:#3b82f6;color:white;font-weight:bold}table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:9px 7px;border-bottom:1px solid #263442;text-align:right;white-space:nowrap}th:first-child,td:first-child{text-align:left}.yes{background:#123d24}.pos{color:#6ee7a0}.neg{color:#ff9696}.e{color:#ffb4b4;font-size:12px}.sub{color:#aab8c5;font-size:13px}@media(max-width:760px){.g{grid-template-columns:1fr 1fr}.scroll{overflow-x:auto}}</style></head><body><div class=w><div class=c><h2>Multi-Exchange Arbitrage — Paper</h2><div class=sub>OKX + Bybit + Kraken • USDT Spot • auto scan 10 sec • fees/slippage included • no real orders</div></div><div class=c><div class=g><label>Capital $<input id=capital value=100></label><label>OKX fee %<input id=okx value=.10></label><label>Bybit fee %<input id=bybit value=.10></label><label>Kraken fee %<input id=kraken value=.40></label><label>Slippage/side %<input id=slip value=.02></label><label>Green net >= %<input id=threshold value=.05></label></div><p><button onclick=go()>Scan Now</button> <span id=st>Ready</span></p><div id=er class=e></div></div><div class="c scroll"><table><thead><tr><th>Coin</th><th>Buy</th><th>Sell</th><th>Ask</th><th>Bid</th><th>Gross %</th><th>Net %</th><th>Est $</th></tr></thead><tbody id=tb></tbody></table></div></div><script>let b=0;function f(x,d=5){return Number(x).toLocaleString(undefined,{maximumFractionDigits:d})}async function go(){if(b)return;b=1;st.textContent="Scanning...";let q=new URLSearchParams();["capital","okx","bybit","kraken","slip","threshold"].forEach(i=>q.set(i,document.getElementById(i).value));try{let j=await(await fetch("/api/scan?"+q,{cache:"no-store"})).json();tb.innerHTML="";j.rows.forEach(x=>{let r=document.createElement("tr");if(x.positive)r.className="yes";r.innerHTML=`<td><b>${x.coin}</b></td><td>${x.buy}</td><td>${x.sell}</td><td>${f(x.ask,8)}</td><td>${f(x.bid,8)}</td><td>${f(x.gross,3)}%</td><td class=${x.net>=0?"pos":"neg"}>${f(x.net,3)}%</td><td>${f(x.profit,3)}</td>`;tb.appendChild(r)});er.textContent=Object.entries(j.errors).map(x=>x[0]+": "+x[1]).join(" | ");st.textContent="Updated "+new Date().toLocaleTimeString()+" • "+j.exchanges.join(", ")}catch(e){er.textContent=e;st.textContent="Error"}b=0}go();setInterval(go,10000)</script></body></html>'''
 @app.get("/")
-def home():
-    return Response(HTML, mimetype="text/html")
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8080")), threaded=True)
+def home():return Response(HTML,mimetype="text/html")
+if __name__=="__main__":app.run(host="0.0.0.0",port=int(os.environ.get("PORT","8080")),threaded=True)
