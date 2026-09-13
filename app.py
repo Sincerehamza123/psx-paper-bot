@@ -446,7 +446,7 @@ input{background:#09141e;color:white;border:1px solid #33485a;border-radius:8px;
 <div class=k><div class=sub>SL</div><div class=v>0.4%</div></div>
 </div>
 
-<div class=c><button onclick=go()>Scan Now</button> <span id=m class=sub></span><div id=d></div><div id=p></div></div>
+<div class=c><button onclick=go()>Scan Now</button> <button onclick=quickbt(90)>Backtest 90 Days</button> <button onclick=quickbt(180)>Backtest 180 Days</button> <span id=m class=sub></span><div id=d></div><div id=p></div><div id=topbt class=sub style="margin-top:10px">Backtest buttons are here at the top.</div></div>
 
 <div class="c scroll"><h3>Live Candidates</h3>
 <table><thead><tr><th>Coin</th><th>Rank</th><th>RSI</th><th>Vol x</th><th>Mode</th><th>Entry</th></tr></thead><tbody id=tb></tbody></table></div>
@@ -506,8 +506,10 @@ async function load(){
 }
 
 async function go(){await fetch('/api/scan');await load()}
+async function quickbt(n){days.value=n; await runbt();}
 async function runbt(){
  bmsg.textContent='Backtest starting...';
+ if(typeof topbt!=='undefined') topbt.textContent='Backtest '+days.value+' days starting...';
  await fetch('/api/backtest',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({days:parseInt(days.value||90)})});
  setTimeout(load,1000);
 }
