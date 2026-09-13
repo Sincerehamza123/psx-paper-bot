@@ -364,7 +364,7 @@ def api_optimize():
         days=int((request.get_json(silent=True) or {}).get("days",90))
     except:
         days=90
-    days=max(30,min(days,180))
+    days=max(1,min(days,90))
     with lock:
         if state["optimizer"]["running"]:
             return jsonify({"ok":False,"message":"Optimizer already running"}),409
@@ -397,8 +397,8 @@ th:first-child,td:first-child{text-align:left}.scroll{overflow:auto}
 
 <div class=c>
 <h3>Auto Test</h3>
-<div class=sub">RSI, pullback depth, recovery type, volume, TP aur SL ke multiple variants automatically test honge.</div><br>
-Days <input id=days type=number value=90 min=30 max=180>
+<div class=sub">1 se 90 days tak jitne din chahein select karein. RSI, pullback depth, recovery type, volume, TP aur SL ke multiple variants automatically test honge.</div><br>
+Days <input id=days type=number value=15 min=1 max=90 step=1>
 <button onclick=runopt()>Run Auto Backtest</button>
 <div id=msg class=sub style="margin-top:12px"></div>
 </div>
