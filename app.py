@@ -38,6 +38,13 @@ state = {
         "result": None,
         "error": None,
         "last_run": None
+    },
+    "optimizer": {
+        "running": False,
+        "progress": "",
+        "result": None,
+        "error": None,
+        "last_run": None
     }
 }
 lock = threading.RLock()
@@ -397,6 +404,99 @@ def run_backtest(days=90):
         with lock:
             state["backtest"]["running"]=False
 
+
+def run_optimizer(days=90):
+    with lock:
+        state["optimizer"].update({"running":True,"progress":"Starting...","result":None,"error":None})
+    try:
+        rsi_ranges=[(45,60),(48,62),(50,65),(50,68),(52,68),(55,70)]
+        vol_mults=[1.0,1.25,1.5,1.75,2.0]
+        tps=[0.4,0.6,0.8,1.0,1.2,1.5]
+        sls=[0.2,0.3,0.4,0.5,0.6,0.8]
+        cache={}
+        for idx,inst in enumerate(COINS,1):
+            with lock: state["optimizer"]["progress"]=f"Downloading {idx}/{len(COINS)} {inst}"
+            try:
+                h1=hist_bars(inst,"1H",days); m15=hist_bars(inst,"15m",days)
+                if len(h1)>=60 and len(m15)>=60: cache[inst]=(h1,m15)
+            except Exception: pass
+
+        combos=[]; total=len(rsi_ranges)*len(vol_mults)*len(tps)*len(sls); done=0
+        for rlo,rhi in rsi_ranges:
+            for vm in vol_mults:
+                signals=[]
+                for inst,(h1,m15) in cache.items():
+                    for i in range(22,len(m15)-1):
+                        b1,b2=m15[i-1],m15[i]; prior=m15[i-21:i-1]
+                        if len(prior)<20: continue
+                        swing=max(x["h"] for x in prior); avgv=sum(x["v"] for x in prior)/20
+                        if not (b1["c"]>swing and b1["c"]>b1["o"] and b1["v"]>=vm*avgv and b2["c"]>b2["o"]): continue
+                        hrs=[x for x in h1 if x["ts"]<b2["ts"]]
+                        if len(hrs)<55: continue
+                        cls=[x["c"] for x in hrs[-60:]]
+                        e20,e50,rr=ema(cls,20),ema(cls,50),rsi(cls[-30:],14)
+                        if e20 is None or e50 is None or rr is None: continue
+                        if not (e20>e50 and hrs[-1]["c"]>e20 and rlo<=rr<=rhi): continue
+                        signals.append({"coin":inst,"day":utc_date(b2["ts"]),"entry":b2["c"],"idx":i,"m15":m15,"volx":b1["v"]/avgv if avgv else 0,"rsi":rr})
+
+                for tp_pct in tps:
+                    for sl_pct in sls:
+                        done+=1
+                        with lock: state["optimizer"]["progress"]=f"Testing {done}/{total}"
+                        evals=[]
+                        for s in signals:
+                            entry=s["entry"]; tp=entry*(1+tp_pct/100); sl=entry*(1-sl_pct/100); qty=NOTIONAL/entry
+                            exit_px=None; reason=None; m15=s["m15"]; day=s["day"]
+                            for j in range(s["idx"]+1,len(m15)):
+                                x=m15[j]
+                                if utc_date(x["ts"])!=day:
+                                    exit_px=m15[j-1]["c"]; reason="DAY_END"; break
+                                if x["l"]<=sl: exit_px=sl; reason="SL"; break
+                                if x["h"]>=tp: exit_px=tp; reason="TP"; break
+                            if exit_px is None: exit_px=m15[-1]["c"]; reason="END"
+                            gross=qty*(exit_px-entry)
+                            costs=(NOTIONAL+qty*exit_px)*(FEE+SLIP)
+                            evals.append({"day":day,"net":gross-costs,"reason":reason,"volx":s["volx"],"rsi":s["rsi"]})
+
+                        byday={}
+                        for t in evals: byday.setdefault(t["day"],[]).append(t)
+                        chosen=[sorted(v,key=lambda x:(x["volx"],x["rsi"]),reverse=True)[0] for d,v in sorted(byday.items())]
+
+                        bal=CAPITAL; peak=CAPITAL; maxdd=0; wins=0
+                        for t in chosen:
+                            bal+=t["net"]; peak=max(peak,bal)
+                            if peak>0: maxdd=max(maxdd,(peak-bal)/peak*100)
+                            if t["net"]>0: wins+=1
+                        n=len(chosen); netp=bal-CAPITAL; wr=(wins/n*100) if n else 0
+                        sample=min(1,n/20) if n else 0
+                        score=(netp-0.35*maxdd)*sample
+                        combos.append({"rsi":f"{rlo}-{rhi}","vol_mult":vm,"tp_pct":tp_pct,"sl_pct":sl_pct,
+                                       "trades":n,"win_rate":wr,"net_pnl":netp,"ending_balance":bal,
+                                       "max_drawdown_pct":maxdd,"score":score})
+        combos.sort(key=lambda x:(x["score"],x["net_pnl"]),reverse=True)
+        profitable=[x for x in combos if x["net_pnl"]>0 and x["trades"]>=10]
+        result={"days":days,"variants_tested":len(combos),"best":combos[0] if combos else None,
+                "best_profitable":profitable[0] if profitable else None,"top10":combos[:10],
+                "note":"Same-sample optimization can overfit; prefer positive P/L with reasonable trades and lower drawdown."}
+        with lock:
+            state["optimizer"].update({"result":result,"progress":"Complete","last_run":datetime.now(timezone.utc).isoformat()})
+    except Exception as e:
+        with lock: state["optimizer"].update({"error":repr(e),"progress":"Failed"})
+    finally:
+        with lock: state["optimizer"]["running"]=False
+
+@app.post("/api/optimize")
+def api_optimize():
+    try:
+        payload=__import__("flask").request.get_json(silent=True) or {}
+        days=max(30,min(int(payload.get("days",90)),180))
+    except: days=90
+    with lock:
+        if state["optimizer"]["running"]:
+            return jsonify({"ok":False,"message":"Optimizer already running"}),409
+        threading.Thread(target=run_optimizer,args=(days,),daemon=True).start()
+    return jsonify({"ok":True,"days":days})
+
 @app.get("/api/status")
 def status():
     with lock: return jsonify(state)
@@ -463,6 +563,17 @@ Days <input id=days type=number value=90 min=30 max=180>
 
 <div class="c grid" id=bsum></div>
 
+
+<div class=c><h3>Auto Optimizer</h3>
+<div class=sub">RSI, volume, TP aur SL ke 1,080 combinations automatically test karega.</div><br>
+Days <input id=odays type=number value=90 min=30 max=180>
+<button onclick=runopt()>Auto Test</button>
+<div id=omsg class=sub style="margin-top:10px"></div></div>
+
+<div class="c grid" id=osum></div>
+
+<div class="c scroll"><h3>Top 10 Optimized Setups</h3>
+<table><thead><tr><th>#</th><th>RSI</th><th>Vol x</th><th>TP</th><th>SL</th><th>Trades</th><th>Win Rate</th><th>Net P/L</th><th>End</th><th>Max DD</th></tr></thead><tbody id=otb></tbody></table></div>
 <div class="c scroll"><h3>Month-wise Backtest</h3>
 <table><thead><tr><th>Month</th><th>Trades</th><th>Wins</th><th>Losses</th><th>Net P/L</th><th>End Balance</th></tr></thead><tbody id=mb></tbody></table></div>
 
@@ -487,6 +598,13 @@ async function load(){
 
  let b=j.backtest||{};
  bmsg.textContent=(b.running?'Running: ':'')+(b.progress||'')+(b.error?' | '+b.error:'');
+ let o=j.optimizer||{};
+ omsg.textContent=(o.running?'Running: ':'')+(o.progress||'')+(o.error?' | '+o.error:'');
+ if(o.result){
+   let r=o.result, best=r.best_profitable||r.best;
+   osum.innerHTML=best?`<div class=k><div class=sub>Best RSI</div><div class=v>${best.rsi}</div></div><div class=k><div class=sub>Volume</div><div class=v>${best.vol_mult}x</div></div><div class=k><div class=sub>TP / SL</div><div class=v>${best.tp_pct}% / ${best.sl_pct}%</div></div><div class=k><div class=sub>Net P/L</div><div class="v ${best.net_pnl>=0?'g':'r'}">$${f(best.net_pnl,2)}</div></div><div class=k><div class=sub>End</div><div class=v>$${f(best.ending_balance,2)}</div></div>`:'';
+   otb.innerHTML=''; (r.top10||[]).forEach((x,i)=>otb.innerHTML+=`<tr><td>#${i+1}</td><td>${x.rsi}</td><td>${x.vol_mult}x</td><td>${x.tp_pct}%</td><td>${x.sl_pct}%</td><td>${x.trades}</td><td>${f(x.win_rate,1)}%</td><td class="${x.net_pnl>=0?'g':'r'}">${f(x.net_pnl,2)}</td><td>${f(x.ending_balance,2)}</td><td>${f(x.max_drawdown_pct,1)}%</td></tr>`);
+ }
  if(b.result){
    let r=b.result;
    bsum.innerHTML=
@@ -507,6 +625,11 @@ async function load(){
 
 async function go(){await fetch('/api/scan');await load()}
 async function quickbt(n){days.value=n; await runbt();}
+async function runopt(){
+ omsg.textContent='Optimizer starting...';
+ await fetch('/api/optimize',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({days:parseInt(odays.value||90)})});
+ setTimeout(load,1000);
+}
 async function runbt(){
  bmsg.textContent='Backtest starting...';
  if(typeof topbt!=='undefined') topbt.textContent='Backtest '+days.value+' days starting...';
