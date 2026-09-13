@@ -154,23 +154,41 @@ def fetch_15m_day(inst_id, day_ts):
 
 def two_green_15m_confirmation(bars, d2_high):
     """
-    D2 high must be broken first.
-    Then require two consecutive completed green 15m candles.
-    The breakout candle itself may count as Green #1 if it is green.
+    STRICT rule:
+    1) The FIRST 15m candle that breaks D2 high must itself be GREEN.
+    2) The VERY NEXT completed 15m candle must also be GREEN.
+    3) If that next candle is red/doji, the setup is rejected for that day.
+    No later pair of green candles can revive the setup.
+
+    Returns (green1, green2) or (None, None).
     """
-    broken = False
-    green_streak = 0
+    for i, b in enumerate(bars):
+        if b["h"] > d2_high:
+            # First breakout candle found.
+            if b["c"] <= b["o"]:
+                return None, None
+            if i + 1 >= len(bars):
+                return None, None  # wait for next completed 15m candle
+            b2 = bars[i + 1]
+            if b2["c"] <= b2["o"]:
+                return None, None
+            return b, b2
+    return None, None
+
+
+def green_body_pct(bar):
+    if not bar or bar["o"] <= 0:
+        return 0.0
+    return max(0.0, (bar["c"] - bar["o"]) / bar["o"] * 100.0)
+
+
+def d2_retest_after_confirmation(bars, confirm_ts, d2_high):
+    """After Green #2 closes, did price retest D2 high?"""
     for b in bars:
-        if not broken and b["h"] > d2_high:
-            broken = True
-        if not broken:
+        if b["ts"] <= confirm_ts:
             continue
-        if b["c"] > b["o"]:
-            green_streak += 1
-            if green_streak >= 2:
-                return b
-        else:
-            green_streak = 0
+        if b["l"] <= d2_high <= b["h"]:
+            return b
     return None
 
 
@@ -227,16 +245,40 @@ def build_live_candidates(top25):
             ask = fnum(tk.get("askPx"), last)
 
             bars15 = [b for b in fetch_15m_recent(iid, 100) if b["confirm"] == "1"]
-            confirm15 = two_green_15m_confirmation(bars15, d2["h"])
+            g1, g2 = two_green_15m_confirmation(bars15, d2["h"])
+            g2_body = green_body_pct(g2) if g2 else None
+            retest = d2_retest_after_confirmation(bars15, g2["ts"], d2["h"]) if g2 and g2_body > 1.0 else None
+
+            # Entry rule:
+            # - Green #2 body <= 1%: enter at Green #2 close.
+            # - Green #2 body > 1%: do NOT chase; wait for D2-high retest and enter at D2 high.
+            entry_ready = False
+            entry_mode = None
+            entry_price = None
+            if g2:
+                if g2_body <= 1.0:
+                    entry_ready = True
+                    entry_mode = "G2_CLOSE"
+                    entry_price = g2["c"]
+                elif retest is not None or (last <= d2["h"] and last > 0):
+                    entry_ready = True
+                    entry_mode = "D2_HIGH_RETEST"
+                    entry_price = d2["h"]
+                else:
+                    entry_mode = "WAIT_D2_HIGH_RETEST"
 
             out.append({
                 **x,
                 "d1_high": d1["h"], "d2_high": d2["h"], "d2_low": d2["l"],
                 "d2_close": d2["c"], "last": last, "ask": ask,
-                "breakout": last > d2["h"] or any(b["h"] > d2["h"] for b in bars15),
-                "confirm_15m_2green": confirm15 is not None,
-                "confirm_15m_close": confirm15["c"] if confirm15 else None,
-                "confirm_15m_ts": confirm15["ts"] if confirm15 else None
+                "breakout": any(b["h"] > d2["h"] for b in bars15),
+                "confirm_15m_2green": g2 is not None,
+                "green2_body_pct": g2_body,
+                "confirm_15m_close": g2["c"] if g2 else None,
+                "confirm_15m_ts": g2["ts"] if g2 else None,
+                "entry_ready": entry_ready,
+                "entry_mode": entry_mode,
+                "entry_price_rule": entry_price
             })
         except Exception:
             continue
@@ -247,11 +289,11 @@ def build_live_candidates(top25):
 def enter_live_if_needed(cands):
     if state["position"] is not None:
         return
-    eligible = [x for x in cands if x["breakout"] and x.get("confirm_15m_2green")]
+    eligible = [x for x in cands if x["breakout"] and x.get("confirm_15m_2green") and x.get("entry_ready")]
     if not eligible:
         return
     pick = eligible[0]
-    entry = pick["ask"] or pick["last"]
+    entry = pick.get("entry_price_rule") or pick["ask"] or pick["last"]
     if entry <= 0:
         return
     sl = pick["d2_low"]
@@ -270,6 +312,8 @@ def enter_live_if_needed(cands):
         "entry": entry, "qty": qty, "notional": actual_notional,
         "margin": MARGIN_PER_TRADE, "leverage": LEVERAGE,
         "sl": sl, "planned_risk_usd": planned_risk,
+        "entry_mode": pick.get("entry_mode"),
+        "green2_body_pct": pick.get("green2_body_pct"),
         "tp": entry * (1 + TP_PCT / 100.0),
         "entry_utc": datetime.now(timezone.utc).isoformat(),
         "entry_ts": int(time.time() * 1000)
@@ -390,12 +434,24 @@ def do_backtest(days):
                     continue
 
                 bars15 = fetch_15m_day(iid, d3_ts)
-                confirm15 = two_green_15m_confirmation(bars15, d2["h"])
-                if confirm15 is None:
+                g1, g2 = two_green_15m_confirmation(bars15, d2["h"])
+                if g2 is None:
                     continue
 
-                entry = confirm15["c"]
-                entry_ts = confirm15["ts"]
+                g2_body = green_body_pct(g2)
+                if g2_body <= 1.0:
+                    entry = g2["c"]
+                    entry_ts = g2["ts"]
+                    entry_mode = "G2_CLOSE"
+                else:
+                    # Green #2 > 1%: wait for a later retest of D2 high.
+                    retest = d2_retest_after_confirmation(bars15, g2["ts"], d2["h"])
+                    if retest is None:
+                        continue
+                    entry = d2["h"]
+                    entry_ts = retest["ts"]
+                    entry_mode = "D2_HIGH_RETEST"
+
                 sl = d2["l"]
                 risk_per_coin = entry - sl
                 if risk_per_coin <= 0:
@@ -427,6 +483,7 @@ def do_backtest(days):
                     "date": datetime.fromtimestamp(d3_ts / 1000, tz=timezone.utc).date().isoformat(),
                     "coin": iid, "rank": rank, "volume_upside_pct": upside,
                     "entry": entry, "entry_15m_ts": entry_ts,
+                    "entry_mode": entry_mode, "green2_body_pct": g2_body,
                     "sl": sl, "qty": qty,
                     "notional": actual_notional, "planned_risk_usd": planned_risk,
                     "exit": exit_px, "exit_reason": exit_reason,
