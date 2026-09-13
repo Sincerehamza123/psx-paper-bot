@@ -1,133 +1,85 @@
-import os, json, urllib.request
-from flask import Flask, jsonify, request, Response
-
+import os,time,json,urllib.request
+from flask import Flask,jsonify,request,Response
 app=Flask(__name__)
 
-RPCS=[
- "https://eth-mainnet.g.alchemy.com/public",
- "https://rpc.nodeflare.app/eth/public",
- "https://cloudflare-eth.com"
-]
-
-# Ethereum mainnet
+CHAIN="arbitrum"
 TOKENS={
- "WETH":("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",18),
- "USDC":("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",6),
- "USDT":("0xdAC17F958D2ee523a2206206994597C13D831ec7",6),
- "DAI": ("0x6B175474E89094C44Da98b954EedeAC495271d0F",18),
- "WBTC":("0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599",8)
+"WETH":"0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",
+"USDC":"0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
+"ARB":"0x912CE59144191C1204E64559FE8253a0e49E6548",
+"LINK":"0xf97f4df75117a78c1A5a0DBb814Af92458539FB4",
+"WBTC":"0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f"
 }
-# V2-compatible factories
-DEXES={
- "Uniswap V2":"0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f",
- "SushiSwap V2":"0xC0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac"
-}
-GETPAIR="e6a43905"
-GETRESERVES="0902f1ac"
-TOKEN0="0dfe1681"
+# Paper assumptions. Scanner is discovery-grade: final executable quote should be verified before any real trade.
+DEX_FEE={"uniswap":0.0030,"sushiswap":0.0030,"camelot":0.0030,"ramses":0.0030,"curve":0.0010}
+DEFAULT_FEE=0.0030
 
-def padaddr(a): return a.lower().replace("0x","").rjust(64,"0")
+def get(url):
+ req=urllib.request.Request(url,headers={"User-Agent":"Mozilla/5.0","Accept":"application/json"})
+ with urllib.request.urlopen(req,timeout=12) as r:return json.loads(r.read().decode())
 
-def rpc(method,params):
-    body=json.dumps({"jsonrpc":"2.0","id":1,"method":method,"params":params}).encode()
-    last=None
-    for u in RPCS:
-        try:
-            req=urllib.request.Request(u,data=body,headers={"Content-Type":"application/json","User-Agent":"Mozilla/5.0"})
-            with urllib.request.urlopen(req,timeout=10) as r:
-                j=json.loads(r.read().decode())
-            if "result" in j:return j["result"]
-            last=str(j.get("error"))
-        except Exception as e:last=str(e)
-    raise RuntimeError("RPC unavailable: "+str(last))
+def pools(sym):
+ a=TOKENS[sym]
+ return get(f"https://api.dexscreener.com/token-pairs/v1/{CHAIN}/{a}")
 
-def eth_call(to,data):
-    return rpc("eth_call",[{"to":to,"data":"0x"+data},"latest"])
+def normalize(sym,arr,minliq):
+ out=[]
+ for x in arr or []:
+  try:
+   b=x.get("baseToken",{}); q=x.get("quoteToken",{})
+   bs=(b.get("symbol") or "").upper(); qs=(q.get("symbol") or "").upper()
+   # only USD-like quote pools so prices are comparable
+   if qs not in ("USDC","USDC.E","USDT","DAI"): continue
+   price=float(x.get("priceUsd") or 0); liq=float((x.get("liquidity") or {}).get("usd") or 0)
+   if price<=0 or liq<minliq: continue
+   dex=(x.get("dexId") or "unknown").lower()
+   out.append({"token":sym,"dex":dex,"pair":x.get("pairAddress",""),"price":price,
+               "liq":liq,"fee":DEX_FEE.get(dex,DEFAULT_FEE),"url":x.get("url","")})
+  except: pass
+ return out
 
-def pair(factory,a,b):
-    x=eth_call(factory,GETPAIR+padaddr(a)+padaddr(b))
-    if not x or int(x,16)==0:return None
-    return "0x"+x[-40:]
-
-def reserves(pairaddr):
-    x=eth_call(pairaddr,GETRESERVES)[2:]
-    return int(x[0:64],16),int(x[64:128],16)
-
-def token0(pairaddr):
-    x=eth_call(pairaddr,TOKEN0)
-    return "0x"+x[-40:].lower()
-
-def pool(dex,base,quote):
-    ba,bd=TOKENS[base];qa,qd=TOKENS[quote]
-    pa=pair(DEXES[dex],ba,qa)
-    if not pa:return None
-    r0,r1=reserves(pa); t0=token0(pa)
-    if t0==ba.lower():
-        rb,rq=r0/(10**bd),r1/(10**qd)
-    else:
-        rb,rq=r1/(10**bd),r0/(10**qd)
-    if rb<=0 or rq<=0:return None
-    return {"pair":pa,"base_reserve":rb,"quote_reserve":rq,"price":rq/rb}
-
-def swap_out(amount_in,res_in,res_out,fee=.003):
-    ai=amount_in*(1-fee)
-    return (ai*res_out)/(res_in+ai)
-
-def gas_usd():
-    try:
-        wei=int(rpc("eth_gasPrice",[]),16)
-        # WETH/USDC Uniswap price as ETH USD proxy
-        u=pool("Uniswap V2","WETH","USDC")
-        ethusd=u["price"] if u else 0
-        # conservative two swaps ~300k gas total
-        return wei/1e18*300000*ethusd
-    except:return 0
+def impact(trade,liq):
+ # conservative paper estimate for a swap against displayed pool liquidity
+ side=max(liq/2,1)
+ return min(0.25, trade/side)
 
 @app.get("/api/scan")
 def scan():
-    capital=max(1,float(request.args.get("capital",100)))
-    gas_override=float(request.args.get("gas",0))
-    rows=[]; errors=[]
-    gas=gas_override if gas_override>0 else gas_usd()
-    for mid in ["WETH","WBTC","DAI","USDT"]:
-        try:
-            pools={}
-            for dex in DEXES:
-                z=pool(dex,mid,"USDC")
-                if z:pools[dex]=z
-            if len(pools)<2:continue
-            for buy in pools:
-                for sell in pools:
-                    if buy==sell:continue
-                    # Spend USDC on buy DEX -> MID, then MID on sell DEX -> USDC
-                    bp=pools[buy]; sp=pools[sell]
-                    midout=swap_out(capital,bp["quote_reserve"],bp["base_reserve"])
-                    usdback=swap_out(midout,sp["base_reserve"],sp["quote_reserve"])
-                    before=usdback-capital
-                    net=before-gas
-                    rows.append({
-                      "route":f"USDC → {mid} → USDC","buy":buy,"sell":sell,
-                      "buy_price":bp["price"],"sell_price":sp["price"],
-                      "gross_spread_pct":(sp["price"]/bp["price"]-1)*100,
-                      "before_gas":before,"gas":gas,"profit":net,
-                      "net_pct":net/capital*100
-                    })
-        except Exception as e:errors.append(mid+": "+str(e))
-    rows.sort(key=lambda x:x["profit"],reverse=True)
-    return jsonify(rows=rows,errors=errors,gas=gas,paper_only=True)
+ capital=max(10,float(request.args.get("capital",100)))
+ minliq=max(10000,float(request.args.get("minliq",250000)))
+ gas=max(0,float(request.args.get("gas",0.03)))
+ rows=[]; errors=[]
+ for sym in ("WETH","ARB","LINK","WBTC"):
+  try:
+   ps=normalize(sym,pools(sym),minliq)
+   # compare distinct pools/DEXs
+   for buy in ps:
+    for sell in ps:
+     if buy["pair"]==sell["pair"] or buy["dex"]==sell["dex"]:continue
+     if sell["price"]<=buy["price"]:continue
+     gross=(sell["price"]/buy["price"]-1)
+     fees=buy["fee"]+sell["fee"]
+     imp=impact(capital,buy["liq"])+impact(capital,sell["liq"])
+     net=gross-fees-imp-(gas/capital)
+     rows.append({"token":sym,"buy":buy["dex"],"sell":sell["dex"],
+      "buy_price":buy["price"],"sell_price":sell["price"],
+      "buy_liq":buy["liq"],"sell_liq":sell["liq"],
+      "gross_pct":gross*100,"fees_pct":fees*100,"impact_pct":imp*100,
+      "gas":gas,"net_pct":net*100,"profit":capital*net,
+      "buy_url":buy["url"],"sell_url":sell["url"]})
+  except Exception as e:errors.append(sym+": "+str(e))
+ rows.sort(key=lambda z:z["net_pct"],reverse=True)
+ return jsonify(rows=rows[:80],errors=errors,paper_only=True,chain="Arbitrum",
+                note="Discovery estimate from public pool prices; not an executable quote.")
 
-@app.get("/health")
-def health():
-    try:return jsonify(ok=True,block=int(rpc("eth_blockNumber",[]),16),paper_only=True)
-    except Exception as e:return jsonify(ok=False,error=str(e),paper_only=True),503
-
-HTML=r"""<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>DEX Arbitrage Paper</title>
-<style>*{box-sizing:border-box}body{margin:0;padding:14px;background:#090e14;color:#edf3f8;font-family:Arial}.w{max-width:1000px;margin:auto}.c{background:#121a23;border:1px solid #293746;border-radius:15px;padding:15px;margin-bottom:12px}.sub{color:#aab8c5;line-height:1.5;font-size:13px}.g{display:grid;grid-template-columns:1fr 1fr;gap:10px}label{font-size:12px;color:#aab8c5}input{width:100%;padding:10px;margin-top:5px;background:#091018;color:white;border:1px solid #34475a;border-radius:8px}button{padding:12px 17px;border:0;border-radius:9px;background:#3b82f6;color:white;font-weight:bold}table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:9px 7px;border-bottom:1px solid #263442;text-align:right;white-space:nowrap}th:first-child,td:first-child{text-align:left}.yes{background:#123d24}.pos{color:#6ee7a0;font-weight:bold}.neg{color:#ff9696}.err{color:#ffaaaa;font-size:12px}.scroll{overflow-x:auto}</style></head><body><div class=w>
-<div class=c><h2>Ethereum DEX Arbitrage — Paper</h2><div class=sub>NO API KEY • Ethereum public RPC • Uniswap V2 ↔ SushiSwap V2. USDC se token buy karke doosre DEX par USDC mein paper-sell simulate karta hai. Pool liquidity, 0.30% swap fee each leg aur estimated Ethereum gas included. Koi wallet ya real order nahi.</div></div>
-<div class=c><div class=g><label>Paper Capital USDC<input id=capital value=100 type=number></label><label>Gas override $ (0 = live estimate)<input id=gas value=0 type=number step=.1></label></div><p><button onclick=go()>Scan DEX Now</button> <span id=st>Ready</span></p><div id=er class=err></div></div>
-<div class="c scroll"><table><thead><tr><th>Route</th><th>Buy DEX</th><th>Sell DEX</th><th>Gross %</th><th>Before Gas $</th><th>Gas $</th><th>Net %</th><th>Profit $</th></tr></thead><tbody id=tb></tbody></table></div></div>
-<script>let busy=0;function f(x,d=3){return Number(x).toFixed(d)}async function go(){if(busy)return;busy=1;st.textContent="Scanning live pools...";er.textContent="";try{let q=new URLSearchParams({capital:capital.value,gas:gas.value});let j=await(await fetch("/api/scan?"+q,{cache:"no-store"})).json();tb.innerHTML="";j.rows.forEach(x=>{let r=document.createElement("tr");if(x.profit>0)r.className="yes";r.innerHTML=`<td>${x.route}</td><td>${x.buy}</td><td>${x.sell}</td><td>${f(x.gross_spread_pct)}%</td><td>${f(x.before_gas)}</td><td>${f(x.gas)}</td><td class="${x.net_pct>0?'pos':'neg'}">${f(x.net_pct)}%</td><td class="${x.profit>0?'pos':'neg'}">${f(x.profit)}</td>`;tb.appendChild(r)});er.textContent=(j.errors||[]).join(" | ");st.textContent="Updated "+new Date().toLocaleTimeString()}catch(e){er.textContent=e;st.textContent="Error"}busy=0}go();setInterval(go,15000)</script></body></html>"""
-
+HTML=r"""<!doctype html><html><head><meta name=viewport content="width=device-width,initial-scale=1"><title>Arbitrum Arbitrage Paper</title><style>
+*{box-sizing:border-box}body{margin:0;background:#081018;color:#edf4fb;font-family:Arial;padding:14px}.w{max-width:1100px;margin:auto}.c{background:#111c27;border:1px solid #2a3b4d;border-radius:15px;padding:15px;margin-bottom:12px}.sub{color:#a9bac9;line-height:1.5;font-size:13px}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:9px}label{font-size:12px;color:#a9bac9}input{width:100%;padding:10px;margin-top:5px;background:#07111a;color:white;border:1px solid #38506a;border-radius:8px}button{padding:12px 17px;border:0;border-radius:9px;background:#377df0;color:white;font-weight:bold}.scroll{overflow:auto}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:9px 7px;border-bottom:1px solid #263746;text-align:right;white-space:nowrap}th:first-child,td:first-child{text-align:left}.win{background:#103b25}.pos{color:#67e89a;font-weight:bold}.neg{color:#ff9292}.warn{color:#ffc978;font-size:12px}@media(max-width:650px){.grid{grid-template-columns:1fr 1fr}}</style></head><body><div class=w>
+<div class=c><h2>Arbitrum Multi-DEX Arbitrage — PAPER</h2><div class=sub>API key nahi • wallet nahi • real order nahi. WETH, ARB, LINK, WBTC ke liquid Arbitrum pools ko multiple DEXs par compare karta hai. Green sirf tab jab estimated DEX fees + liquidity impact + gas ke baad net positive ho.</div></div>
+<div class=c><div class=grid><label>Capital $<input id=cap value=100 type=number></label><label>Min Pool Liquidity $<input id=liq value=250000 type=number></label><label>Gas Estimate $<input id=gas value=.03 type=number step=.01></label></div><p><button onclick=go()>Scan Now</button> <span id=st>Ready</span></p><div class=warn>Note: yeh discovery/paper estimate hai. Real-money trade se pehle executable on-chain quote zaroor verify hota hai.</div><div id=err class=neg></div></div>
+<div class="c scroll"><table><thead><tr><th>Token</th><th>Buy</th><th>Sell</th><th>Gross %</th><th>Fees %</th><th>Impact %</th><th>Gas $</th><th>Net %</th><th>Profit $</th><th>Buy Liq</th><th>Sell Liq</th></tr></thead><tbody id=tb></tbody></table></div></div>
+<script>let busy=0;const f=(x,n=3)=>Number(x).toFixed(n);async function go(){if(busy)return;busy=1;st.textContent="Scanning Arbitrum pools...";err.textContent="";try{let q=new URLSearchParams({capital:cap.value,minliq:liq.value,gas:gas.value});let j=await(await fetch("/api/scan?"+q,{cache:"no-store"})).json();tb.innerHTML="";j.rows.forEach(x=>{let r=document.createElement("tr");if(x.net_pct>0)r.className="win";r.innerHTML=`<td>${x.token}</td><td>${x.buy}</td><td>${x.sell}</td><td>${f(x.gross_pct)}%</td><td>${f(x.fees_pct)}%</td><td>${f(x.impact_pct)}%</td><td>${f(x.gas)}</td><td class="${x.net_pct>0?'pos':'neg'}">${f(x.net_pct)}%</td><td class="${x.profit>0?'pos':'neg'}">${f(x.profit)}</td><td>$${Math.round(x.buy_liq).toLocaleString()}</td><td>$${Math.round(x.sell_liq).toLocaleString()}</td>`;tb.appendChild(r)});err.textContent=(j.errors||[]).join(" | ");st.textContent="Updated "+new Date().toLocaleTimeString()+" • "+j.rows.length+" routes"}catch(e){err.textContent=e;st.textContent="Error"}busy=0}go();setInterval(go,15000)</script></body></html>"""
 @app.get("/")
 def home():return Response(HTML,mimetype="text/html")
+@app.get("/health")
+def health():return jsonify(ok=True,paper_only=True,chain="Arbitrum")
 if __name__=="__main__":app.run(host="0.0.0.0",port=int(os.environ.get("PORT","8080")),threaded=True)
