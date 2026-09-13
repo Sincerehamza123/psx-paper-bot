@@ -10,6 +10,7 @@ MARGIN_PER_TRADE = 100.0
 LEVERAGE = 5.0
 NOTIONAL = MARGIN_PER_TRADE * LEVERAGE
 TP_PCT = 20.0
+MAX_RISK_USD = 10.0
 TOP_N = 25
 MIN_DAILY_QUOTE_VOL = 1_000_000.0
 DEFAULT_BACKTEST_DAYS = 180
@@ -198,12 +199,22 @@ def enter_live_if_needed(cands):
     entry = pick["ask"] or pick["last"]
     if entry <= 0:
         return
-    qty = NOTIONAL / entry
+    sl = pick["d2_low"]
+    risk_per_coin = entry - sl
+    if risk_per_coin <= 0:
+        return
+    # Size by max $10 structural risk, but never exceed $500 notional (100 x 5x).
+    risk_qty = MAX_RISK_USD / risk_per_coin
+    max_qty = NOTIONAL / entry
+    qty = min(risk_qty, max_qty)
+    actual_notional = qty * entry
+    planned_risk = qty * risk_per_coin
     state["position"] = {
         "instId": pick["instId"], "rank": pick["rank"],
         "volume_upside_pct": pick["volume_upside_pct"],
-        "entry": entry, "qty": qty, "notional": NOTIONAL,
+        "entry": entry, "qty": qty, "notional": actual_notional,
         "margin": MARGIN_PER_TRADE, "leverage": LEVERAGE,
+        "sl": sl, "planned_risk_usd": planned_risk,
         "tp": entry * (1 + TP_PCT / 100.0),
         "entry_utc": datetime.now(timezone.utc).isoformat(),
         "entry_ts": int(time.time() * 1000)
@@ -224,7 +235,10 @@ def update_live_position():
     entry_day = datetime.fromisoformat(p["entry_utc"]).date()
     exit_reason = None
     exit_px = None
-    if last >= p["tp"]:
+    if last <= p["sl"]:
+        exit_reason = "SL_D2_LOW"
+        exit_px = bid if bid > 0 else last
+    elif last >= p["tp"]:
         exit_reason = "TP20"
         exit_px = bid if bid > 0 else last
     elif now.date() > entry_day:
@@ -320,16 +334,37 @@ def do_backtest(days):
                 if not setup or d3["h"] <= d2["h"]:
                     continue
                 entry = max(d2["h"], d3["o"])
+                sl = d2["l"]
+                risk_per_coin = entry - sl
+                if risk_per_coin <= 0:
+                    continue
+                risk_qty = MAX_RISK_USD / risk_per_coin
+                max_qty = NOTIONAL / entry
+                qty = min(risk_qty, max_qty)
+                actual_notional = qty * entry
+                planned_risk = qty * risk_per_coin
+
                 tp = entry * (1 + TP_PCT / 100.0)
+                # Daily OHLC cannot prove whether SL or TP happened first after breakout.
+                # Use conservative SL-first assumption when both levels are inside D3.
+                sl_hit = d3["l"] <= sl
                 tp_hit = d3["h"] >= tp
-                exit_px = tp if tp_hit else d3["c"]
-                qty = NOTIONAL / entry
+                if sl_hit:
+                    exit_px = sl
+                    exit_reason = "SL_D2_LOW"
+                elif tp_hit:
+                    exit_px = tp
+                    exit_reason = "TP20"
+                else:
+                    exit_px = d3["c"]
+                    exit_reason = "DAY_END"
                 pnl = qty * (exit_px - entry)
                 candidates.append({
                     "date": datetime.fromtimestamp(d3_ts / 1000, tz=timezone.utc).date().isoformat(),
                     "coin": iid, "rank": rank, "volume_upside_pct": upside,
-                    "entry": entry, "exit": exit_px,
-                    "exit_reason": "TP20" if tp_hit else "DAY_END",
+                    "entry": entry, "sl": sl, "qty": qty,
+                    "notional": actual_notional, "planned_risk_usd": planned_risk,
+                    "exit": exit_px, "exit_reason": exit_reason,
                     "pnl_usd": pnl,
                     "return_on_margin_pct": pnl / MARGIN_PER_TRADE * 100.0
                 })
@@ -370,7 +405,8 @@ def do_backtest(days):
             "starting_balance": START_BALANCE,
             "fixed_margin_per_trade": MARGIN_PER_TRADE,
             "leverage": LEVERAGE,
-            "fixed_notional_per_trade": NOTIONAL,
+            "max_notional_per_trade": NOTIONAL,
+            "max_risk_usd": MAX_RISK_USD,
             "tp_pct": TP_PCT,
             "total_trades": len(trades),
             "wins": wins,
@@ -405,7 +441,8 @@ def api_status():
                 "starting_balance": START_BALANCE,
                 "margin_per_trade": MARGIN_PER_TRADE,
                 "leverage": LEVERAGE,
-                "notional_per_trade": NOTIONAL,
+                "max_notional_per_trade": NOTIONAL,
+                "max_risk_usd": MAX_RISK_USD,
                 "tp_pct": TP_PCT,
                 "top_n": TOP_N,
                 "max_open_positions": 1
@@ -438,21 +475,21 @@ HTML = '''<!doctype html><html><head><meta name="viewport" content="width=device
 <style>
 body{margin:0;background:#071019;color:#eef6ff;font-family:Arial;padding:14px}.w{max-width:1200px;margin:auto}.c{background:#111d29;border:1px solid #27394b;border-radius:14px;padding:14px;margin-bottom:12px}h2,h3{margin-top:0}.sub{color:#a8bacb;font-size:13px;line-height:1.55}.grid{display:grid;grid-template-columns:repeat(5,1fr);gap:8px}.k{background:#09141e;padding:10px;border-radius:9px}.v{font-size:20px;font-weight:bold}.g{color:#6ff0a0}.r{color:#ff9999}.y{color:#ffd479}.tabs{display:flex;gap:8px;margin-bottom:12px}.tab{padding:10px 14px;border-radius:9px;background:#142536;cursor:pointer}.tab.on{background:#387df3}.pane{display:none}.pane.on{display:block}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:8px;border-bottom:1px solid #253645;text-align:right;white-space:nowrap}th:first-child,td:first-child{text-align:left}.scroll{overflow:auto}button{padding:10px 14px;border:0;border-radius:8px;background:#387df3;color:#fff;font-weight:bold;cursor:pointer}input{background:#09141e;color:#fff;border:1px solid #33485a;border-radius:8px;padding:9px;width:90px}@media(max-width:700px){.grid{grid-template-columns:1fr 1fr}}
 </style></head><body><div class="w">
-<div class="c"><h2>Top-25 Volume Upside + 3-Candle Breakout</h2><div class="sub">PAPER ONLY — $100 margin × 5x = $500 trade. Previous completed day ke Volume Upside ranking se Top-25 coins. D0 Red ke baad Green #1 + Green #2. D3 par Green #2 ka High break ho to signal. Long green streak ke beech ka G-G pair valid nahi. Multiple signals mein highest-ranked coin trade hota hai. TP +20%, warna day-end exit.</div></div>
-<div class="c grid"><div class="k"><div class="sub">Start Balance</div><div class="v">$100</div></div><div class="k"><div class="sub">Margin</div><div class="v">$100</div></div><div class="k"><div class="sub">Leverage</div><div class="v">5x</div></div><div class="k"><div class="sub">Trade Size</div><div class="v">$500</div></div><div class="k"><div class="sub">TP</div><div class="v">20%</div></div></div>
+<div class="c"><h2>Top-25 Volume Upside + 3-Candle Breakout</h2><div class="sub">PAPER ONLY — max $100 margin × 5x = $500 notional. Qty D3 entry se D2 Low tak distance par size hoti hai taa-ke planned SL max $10 ho. Previous completed day ke Volume Upside ranking se Top-25 coins. D0 Red ke baad Green #1 + Green #2. D3 par Green #2 ka High break ho to signal. Long green streak ke beech ka G-G pair valid nahi. Multiple signals mein highest-ranked coin trade hota hai. TP +20%, warna day-end exit.</div></div>
+<div class="c grid"><div class="k"><div class="sub">Start Balance</div><div class="v">$100</div></div><div class="k"><div class="sub">Margin</div><div class="v">$100</div></div><div class="k"><div class="sub">Leverage</div><div class="v">5x</div></div><div class="k"><div class="sub">Max Notional</div><div class="v">$500</div></div><div class="k"><div class="sub">Max SL Risk</div><div class="v">$10</div></div><div class="k"><div class="sub">TP</div><div class="v">20%</div></div></div>
 <div class="tabs"><div id="tLive" class="tab on" onclick="showTab('live')">LIVE PAPER</div><div id="tBt" class="tab" onclick="showTab('bt')">BACKTEST</div></div>
 <div id="live" class="pane on"><div class="c"><button onclick="scanNow()">Scan Now</button> <span id="liveMsg" class="sub"></span><div id="pos" style="margin-top:12px"></div></div>
 <div class="c scroll"><h3>Valid Setup Candidates</h3><table><thead><tr><th>Coin</th><th>Vol Rank</th><th>Vol Upside</th><th>D2 High</th><th>Last</th><th>Breakout</th></tr></thead><tbody id="cb"></tbody></table></div>
 <div class="c scroll"><h3>Previous-Day Top 25</h3><table><thead><tr><th>Coin</th><th>Rank</th><th>Vol Upside</th><th>Quote Volume</th></tr></thead><tbody id="tb"></tbody></table></div>
-<div class="c scroll"><h3>Live Paper Trades</h3><table><thead><tr><th>Coin</th><th>Rank</th><th>Entry</th><th>Exit</th><th>Reason</th><th>P/L $</th></tr></thead><tbody id="trb"></tbody></table></div></div>
+<div class="c scroll"><h3>Live Paper Trades</h3><table><thead><tr><th>Coin</th><th>Rank</th><th>Entry</th><th>SL</th><th>Qty</th><th>Risk $</th><th>Exit</th><th>Reason</th><th>P/L $</th></tr></thead><tbody id="trb"></tbody></table></div></div>
 <div id="bt" class="pane"><div class="c"><h3>Historical Backtest</h3><div class="sub">Recommended 180 days. First run thora time le sakta hai.</div><br>Days: <input id="days" type="number" value="180" min="30" max="190"> <button onclick="startBacktest()">Run Backtest</button><div id="btMsg" class="sub" style="margin-top:10px"></div></div>
 <div id="btSummary" class="c grid"></div><div class="c scroll"><h3>Month-wise Result</h3><table><thead><tr><th>Month</th><th>Trades</th><th>Wins</th><th>Losses</th><th>P/L $</th><th>End Balance</th></tr></thead><tbody id="mb"></tbody></table></div>
-<div class="c scroll"><h3>Backtest Trades</h3><table><thead><tr><th>Date</th><th>Coin</th><th>Rank</th><th>Vol Upside</th><th>Entry</th><th>Exit</th><th>Reason</th><th>P/L $</th><th>Balance</th></tr></thead><tbody id="btb"></tbody></table></div></div>
+<div class="c scroll"><h3>Backtest Trades</h3><table><thead><tr><th>Date</th><th>Coin</th><th>Rank</th><th>Vol Upside</th><th>Entry</th><th>SL</th><th>Qty</th><th>Risk $</th><th>Exit</th><th>Reason</th><th>P/L $</th><th>Balance</th></tr></thead><tbody id="btb"></tbody></table></div></div>
 </div><script>
 const f=(x,n=4)=>Number(x||0).toFixed(n);function showTab(x){live.className='pane'+(x==='live'?' on':'');bt.className='pane'+(x==='bt'?' on':'');tLive.className='tab'+(x==='live'?' on':'');tBt.className='tab'+(x==='bt'?' on':'');}
-async function load(){try{let j=await(await fetch('/api/status',{cache:'no-store'})).json();liveMsg.textContent='Last scan: '+(j.last_scan||'—')+(j.last_error?' | '+j.last_error:'');if(j.position){let p=j.position;pos.innerHTML=`<b class=g>OPEN:</b> ${p.instId} | Rank #${p.rank} | Entry ${f(p.entry,6)} | TP ${f(p.tp,6)} | $500 notional`}else pos.innerHTML='<span class=y>No open trade</span>';cb.innerHTML='';(j.candidates||[]).forEach(x=>cb.innerHTML+=`<tr><td>${x.instId}</td><td>#${x.rank}</td><td>${f(x.volume_upside_pct,2)}%</td><td>${f(x.d2_high,6)}</td><td>${f(x.last,6)}</td><td class="${x.breakout?'g':'r'}">${x.breakout?'YES':'NO'}</td></tr>`);tb.innerHTML='';(j.top25||[]).forEach(x=>tb.innerHTML+=`<tr><td>${x.instId}</td><td>#${x.rank}</td><td>${f(x.volume_upside_pct,2)}%</td><td>${f(x.prev_quote_volume,0)}</td></tr>`);trb.innerHTML='';[...(j.trades||[])].reverse().forEach(x=>trb.innerHTML+=`<tr><td>${x.instId}</td><td>#${x.rank}</td><td>${f(x.entry,6)}</td><td>${f(x.exit,6)}</td><td>${x.exit_reason}</td><td class="${x.pnl_usd_gross>=0?'g':'r'}">${f(x.pnl_usd_gross,2)}</td></tr>`);let b=j.backtest||{};btMsg.textContent=(b.running?'Running: ':'')+(b.progress||'')+(b.error?' | '+b.error:'');if(b.result)renderBacktest(b.result);}catch(e){}}
+async function load(){try{let j=await(await fetch('/api/status',{cache:'no-store'})).json();liveMsg.textContent='Last scan: '+(j.last_scan||'—')+(j.last_error?' | '+j.last_error:'');if(j.position){let p=j.position;pos.innerHTML=`<b class=g>OPEN:</b> ${p.instId} | Rank #${p.rank} | Entry ${f(p.entry,6)} | SL ${f(p.sl,6)} | Qty ${f(p.qty,4)} | Risk $${f(p.planned_risk_usd,2)} | Notional $${f(p.notional,2)} | TP ${f(p.tp,6)}`}else pos.innerHTML='<span class=y>No open trade</span>';cb.innerHTML='';(j.candidates||[]).forEach(x=>cb.innerHTML+=`<tr><td>${x.instId}</td><td>#${x.rank}</td><td>${f(x.volume_upside_pct,2)}%</td><td>${f(x.d2_high,6)}</td><td>${f(x.last,6)}</td><td class="${x.breakout?'g':'r'}">${x.breakout?'YES':'NO'}</td></tr>`);tb.innerHTML='';(j.top25||[]).forEach(x=>tb.innerHTML+=`<tr><td>${x.instId}</td><td>#${x.rank}</td><td>${f(x.volume_upside_pct,2)}%</td><td>${f(x.prev_quote_volume,0)}</td></tr>`);trb.innerHTML='';[...(j.trades||[])].reverse().forEach(x=>trb.innerHTML+=`<tr><td>${x.instId}</td><td>#${x.rank}</td><td>${f(x.entry,6)}</td><td>${f(x.exit,6)}</td><td>${x.exit_reason}</td><td class="${x.pnl_usd_gross>=0?'g':'r'}">${f(x.pnl_usd_gross,2)}</td></tr>`);let b=j.backtest||{};btMsg.textContent=(b.running?'Running: ':'')+(b.progress||'')+(b.error?' | '+b.error:'');if(b.result)renderBacktest(b.result);}catch(e){}}
 async function scanNow(){liveMsg.textContent='Scanning...';await fetch('/api/scan-now');await load();}async function startBacktest(){let d=parseInt(days.value||180);btMsg.textContent='Starting...';await fetch('/api/backtest',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({days:d})});showTab('bt');setTimeout(load,1000);}
-function renderBacktest(r){btSummary.innerHTML=`<div class=k><div class=sub>Total Trades</div><div class=v>${r.total_trades}</div></div><div class=k><div class=sub>Win Rate</div><div class=v>${f(r.win_rate_pct,1)}%</div></div><div class=k><div class=sub>TP20 Hits</div><div class=v>${r.tp20_hits}</div></div><div class=k><div class=sub>Net P/L</div><div class="v ${r.net_pnl_usd_gross>=0?'g':'r'}">$${f(r.net_pnl_usd_gross,2)}</div></div><div class=k><div class=sub>End Balance</div><div class=v>$${f(r.ending_balance_gross,2)}</div></div>`;mb.innerHTML='';(r.months||[]).forEach(x=>mb.innerHTML+=`<tr><td>${x.month}</td><td>${x.trades}</td><td>${x.wins}</td><td>${x.losses}</td><td class="${x.pnl_usd>=0?'g':'r'}">${f(x.pnl_usd,2)}</td><td>${f(x.ending_balance,2)}</td></tr>`);btb.innerHTML='';[...(r.trades||[])].reverse().forEach(x=>btb.innerHTML+=`<tr><td>${x.date}</td><td>${x.coin}</td><td>#${x.rank}</td><td>${f(x.volume_upside_pct,2)}%</td><td>${f(x.entry,6)}</td><td>${f(x.exit,6)}</td><td>${x.exit_reason}</td><td class="${x.pnl_usd>=0?'g':'r'}">${f(x.pnl_usd,2)}</td><td>${f(x.balance_after,2)}</td></tr>`);}
+function renderBacktest(r){btSummary.innerHTML=`<div class=k><div class=sub>Total Trades</div><div class=v>${r.total_trades}</div></div><div class=k><div class=sub>Win Rate</div><div class=v>${f(r.win_rate_pct,1)}%</div></div><div class=k><div class=sub>TP20 Hits</div><div class=v>${r.tp20_hits}</div></div><div class=k><div class=sub>Net P/L</div><div class="v ${r.net_pnl_usd_gross>=0?'g':'r'}">$${f(r.net_pnl_usd_gross,2)}</div></div><div class=k><div class=sub>End Balance</div><div class=v>$${f(r.ending_balance_gross,2)}</div></div>`;mb.innerHTML='';(r.months||[]).forEach(x=>mb.innerHTML+=`<tr><td>${x.month}</td><td>${x.trades}</td><td>${x.wins}</td><td>${x.losses}</td><td class="${x.pnl_usd>=0?'g':'r'}">${f(x.pnl_usd,2)}</td><td>${f(x.ending_balance,2)}</td></tr>`);btb.innerHTML='';[...(r.trades||[])].reverse().forEach(x=>btb.innerHTML+=`<tr><td>${x.date}</td><td>${x.coin}</td><td>#${x.rank}</td><td>${f(x.volume_upside_pct,2)}%</td><td>${f(x.entry,6)}</td><td>${f(x.sl,6)}</td><td>${f(x.qty,4)}</td><td>${f(x.planned_risk_usd,2)}</td><td>${f(x.exit,6)}</td><td>${x.exit_reason}</td><td class="${x.pnl_usd>=0?'g':'r'}">${f(x.pnl_usd,2)}</td><td>${f(x.balance_after,2)}</td></tr>`);}
 load();setInterval(load,15000);
 </script></body></html>'''
 
