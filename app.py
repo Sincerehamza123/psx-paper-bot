@@ -126,6 +126,54 @@ def fetch_daily_history(inst_id, days=180):
     return bars
 
 
+
+def fetch_15m_recent(inst_id, limit=100):
+    data = jget("/api/v5/market/candles", {
+        "instId": inst_id, "bar": "15m", "limit": str(min(max(limit, 10), 100))
+    })
+    bars = [parse_bar(r) for r in data if len(r) >= 9]
+    bars.sort(key=lambda x: x["ts"])
+    return bars
+
+
+def fetch_15m_day(inst_id, day_ts):
+    """Return completed 15m bars for one UTC day."""
+    day_start = int(day_ts)
+    day_end = day_start + 24 * 60 * 60 * 1000
+    data = jget("/api/v5/market/history-candles", {
+        "instId": inst_id,
+        "bar": "15m",
+        "after": str(day_end + 1),
+        "limit": "100"
+    })
+    bars = [parse_bar(r) for r in data if len(r) >= 9]
+    bars = [b for b in bars if day_start <= b["ts"] < day_end and b["confirm"] == "1"]
+    bars.sort(key=lambda x: x["ts"])
+    return bars
+
+
+def two_green_15m_confirmation(bars, d2_high):
+    """
+    D2 high must be broken first.
+    Then require two consecutive completed green 15m candles.
+    The breakout candle itself may count as Green #1 if it is green.
+    """
+    broken = False
+    green_streak = 0
+    for b in bars:
+        if not broken and b["h"] > d2_high:
+            broken = True
+        if not broken:
+            continue
+        if b["c"] > b["o"]:
+            green_streak += 1
+            if green_streak >= 2:
+                return b
+        else:
+            green_streak = 0
+    return None
+
+
 def ticker_map():
     data = jget("/api/v5/market/tickers", {"instType": "SPOT"})
     return {x.get("instId"): x for x in data}
@@ -177,11 +225,18 @@ def build_live_candidates(top25):
             tk = tmap.get(iid, {})
             last = fnum(tk.get("last"))
             ask = fnum(tk.get("askPx"), last)
+
+            bars15 = [b for b in fetch_15m_recent(iid, 100) if b["confirm"] == "1"]
+            confirm15 = two_green_15m_confirmation(bars15, d2["h"])
+
             out.append({
                 **x,
                 "d1_high": d1["h"], "d2_high": d2["h"], "d2_low": d2["l"],
                 "d2_close": d2["c"], "last": last, "ask": ask,
-                "breakout": last > d2["h"]
+                "breakout": last > d2["h"] or any(b["h"] > d2["h"] for b in bars15),
+                "confirm_15m_2green": confirm15 is not None,
+                "confirm_15m_close": confirm15["c"] if confirm15 else None,
+                "confirm_15m_ts": confirm15["ts"] if confirm15 else None
             })
         except Exception:
             continue
@@ -192,7 +247,7 @@ def build_live_candidates(top25):
 def enter_live_if_needed(cands):
     if state["position"] is not None:
         return
-    eligible = [x for x in cands if x["breakout"]]
+    eligible = [x for x in cands if x["breakout"] and x.get("confirm_15m_2green")]
     if not eligible:
         return
     pick = eligible[0]
@@ -333,36 +388,46 @@ def do_backtest(days):
                 setup = d0["c"] < d0["o"] and d1["c"] > d1["o"] and d2["c"] > d2["o"]
                 if not setup or d3["h"] <= d2["h"]:
                     continue
-                entry = max(d2["h"], d3["o"])
+
+                bars15 = fetch_15m_day(iid, d3_ts)
+                confirm15 = two_green_15m_confirmation(bars15, d2["h"])
+                if confirm15 is None:
+                    continue
+
+                entry = confirm15["c"]
+                entry_ts = confirm15["ts"]
                 sl = d2["l"]
                 risk_per_coin = entry - sl
                 if risk_per_coin <= 0:
                     continue
+
                 risk_qty = MAX_RISK_USD / risk_per_coin
                 max_qty = NOTIONAL / entry
                 qty = min(risk_qty, max_qty)
                 actual_notional = qty * entry
                 planned_risk = qty * risk_per_coin
-
                 tp = entry * (1 + TP_PCT / 100.0)
-                # Daily OHLC cannot prove whether SL or TP happened first after breakout.
-                # Use conservative SL-first assumption when both levels are inside D3.
-                sl_hit = d3["l"] <= sl
-                tp_hit = d3["h"] >= tp
-                if sl_hit:
-                    exit_px = sl
-                    exit_reason = "SL_D2_LOW"
-                elif tp_hit:
-                    exit_px = tp
-                    exit_reason = "TP20"
-                else:
-                    exit_px = d3["c"]
-                    exit_reason = "DAY_END"
+
+                exit_px = d3["c"]
+                exit_reason = "DAY_END"
+                for b15 in bars15:
+                    if b15["ts"] <= entry_ts:
+                        continue
+                    if b15["l"] <= sl:
+                        exit_px = sl
+                        exit_reason = "SL_D2_LOW"
+                        break
+                    if b15["h"] >= tp:
+                        exit_px = tp
+                        exit_reason = "TP20"
+                        break
+
                 pnl = qty * (exit_px - entry)
                 candidates.append({
                     "date": datetime.fromtimestamp(d3_ts / 1000, tz=timezone.utc).date().isoformat(),
                     "coin": iid, "rank": rank, "volume_upside_pct": upside,
-                    "entry": entry, "sl": sl, "qty": qty,
+                    "entry": entry, "entry_15m_ts": entry_ts,
+                    "sl": sl, "qty": qty,
                     "notional": actual_notional, "planned_risk_usd": planned_risk,
                     "exit": exit_px, "exit_reason": exit_reason,
                     "pnl_usd": pnl,
