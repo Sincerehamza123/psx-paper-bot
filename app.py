@@ -589,6 +589,153 @@ def do_backtest(days):
             state["backtest"]["running"] = False
 
 
+
+def run_optimizer(days):
+    """Paper research optimizer. Does not alter live trading rules."""
+    with lock:
+        state["backtest"]["running"] = True
+        state["backtest"]["progress"] = "Optimizer starting..."
+        state["backtest"]["error"] = None
+    try:
+        ids = get_instruments()
+        hist = {}
+        for idx, iid in enumerate(ids, 1):
+            with lock:
+                state["backtest"]["progress"] = f"Optimizer history {idx}/{len(ids)}: {iid}"
+            try:
+                bars = fetch_daily_history(iid, days)
+                if len(bars) >= 5:
+                    hist[iid] = {b["ts"]: b for b in bars}
+            except Exception:
+                pass
+
+        dates = sorted({ts for mp in hist.values() for ts in mp})
+        cutoff = utc_day_ms(datetime.now(timezone.utc) - timedelta(days=days))
+        dates = [x for x in dates if x >= cutoff]
+
+        modes = ["NORMAL_2GREEN", "G2_CLOSE_GT_G1_HIGH"]
+        body_limits = [0.5, 1.0, 1.5, 2.0, None]
+        tps = [2.0,3.0,4.0,5.0,6.0,8.0,10.0,15.0,20.0]
+        combos = {}
+        for mode in modes:
+            for lim in body_limits:
+                for tpv in tps:
+                    key=(mode,lim,tpv)
+                    combos[key]={"pnl":0.0,"trades":0,"wins":0,"losses":0,"tp_hits":0}
+
+        # One selected coin per day per variant, highest volume rank.
+        for di in range(3, len(dates)):
+            d3ts,d2ts,d1ts,d0ts=dates[di],dates[di-1],dates[di-2],dates[di-3]
+            ranking=[]
+            for iid,mp in hist.items():
+                if not all(x in mp for x in (d0ts,d1ts,d2ts,d3ts)): continue
+                d0,d1,d2,d3=mp[d0ts],mp[d1ts],mp[d2ts],mp[d3ts]
+                if d1["quote_vol"]<=0 or d2["quote_vol"]<MIN_DAILY_QUOTE_VOL: continue
+                upside=(d2["quote_vol"]/d1["quote_vol"]-1)*100
+                ranking.append((upside,iid,d0,d1,d2,d3))
+            ranking.sort(reverse=True,key=lambda z:z[0])
+            top25=ranking[:TOP_N]
+
+            day_choices={k:None for k in combos}
+            for rank,item in enumerate(top25,1):
+                upside,iid,d0,d1,d2,d3=item
+                # First two greens of a new run only.
+                if not (d0["c"] < d0["o"] and d1["c"] > d1["o"] and d2["c"] > d2["o"]):
+                    continue
+                if d3["h"] <= d2["h"]: continue
+                try:
+                    bars15=fetch_15m_day(iid,d3ts)
+                except Exception:
+                    continue
+                g1,g2=two_green_15m_confirmation(bars15,d2["h"])
+                if g2 is None: continue
+                g2body=green_body_pct(g2)
+
+                for mode in modes:
+                    if mode=="G2_CLOSE_GT_G1_HIGH" and g2["c"] <= g1["h"]:
+                        continue
+                    for lim in body_limits:
+                        # If G2 exceeds chosen body threshold, wait for D2-high retest.
+                        if lim is not None and g2body > lim:
+                            rt=d2_retest_after_confirmation(bars15,g2["ts"],d2["h"])
+                            if rt is None: continue
+                            entry=d2["h"]; entryts=rt["ts"]
+                        else:
+                            entry=g2["c"]; entryts=g2["ts"]
+
+                        sl=d2["l"]
+                        risk=entry-sl
+                        if risk<=0: continue
+                        qty=min(MAX_RISK_USD/risk, NOTIONAL/entry)
+                        if qty<=0: continue
+
+                        for tpv in tps:
+                            key=(mode,lim,tpv)
+                            if day_choices[key] is not None: continue
+                            tp=entry*(1+tpv/100)
+                            ex=d3["c"]; reason="DAY_END"
+                            for b in bars15:
+                                if b["ts"]<=entryts: continue
+                                if b["l"]<=sl:
+                                    ex=sl; reason="SL"; break
+                                if b["h"]>=tp:
+                                    ex=tp; reason="TP"; break
+                            pnl=qty*(ex-entry)
+                            day_choices[key]=(rank,pnl,reason)
+
+            for key,ch in day_choices.items():
+                if ch is None: continue
+                _,pnl,reason=ch
+                r=combos[key]; r["trades"]+=1; r["pnl"]+=pnl
+                if pnl>0:r["wins"]+=1
+                elif pnl<0:r["losses"]+=1
+                if reason=="TP":r["tp_hits"]+=1
+
+        rows=[]
+        for (mode,lim,tpv),r in combos.items():
+            if not r["trades"]: continue
+            rows.append({
+                "confirmation":mode,
+                "g2_body_max_pct":"NO_LIMIT" if lim is None else lim,
+                "tp_pct":tpv,
+                "trades":r["trades"],"wins":r["wins"],"losses":r["losses"],
+                "win_rate_pct":r["wins"]/r["trades"]*100,
+                "tp_hits":r["tp_hits"],"net_pnl_usd":r["pnl"],
+                "ending_balance":START_BALANCE+r["pnl"]
+            })
+        rows.sort(key=lambda x:x["net_pnl_usd"],reverse=True)
+        result={
+            "optimizer":True,"days_requested":days,
+            "variants_tested":len(rows),
+            "best":rows[0] if rows else None,
+            "top20":rows[:20],
+            "note":"Research only. Ranked on same historical sample; best result can be overfit. Fees/slippage are not deducted."
+        }
+        with lock:
+            state["backtest"]["result"]=result
+            state["backtest"]["progress"]="Optimizer complete"
+            state["backtest"]["last_run"]=datetime.now(timezone.utc).isoformat()
+    except Exception as e:
+        with lock:
+            state["backtest"]["error"]=repr(e)
+            state["backtest"]["progress"]="Optimizer failed"
+    finally:
+        with lock:
+            state["backtest"]["running"]=False
+
+@app.post("/api/optimize")
+def api_optimize():
+    try:
+        days=int((request.get_json(silent=True) or {}).get("days",180))
+    except:
+        days=180
+    days=max(30,min(days,190))
+    with lock:
+        if state["backtest"]["running"]:
+            return jsonify({"ok":False,"message":"Another backtest is running"}),409
+        threading.Thread(target=run_optimizer,args=(days,),daemon=True).start()
+    return jsonify({"ok":True,"message":"Optimizer started","days":days})
+
 @app.get("/api/status")
 def api_status():
     with lock:
@@ -643,12 +790,27 @@ body{margin:0;background:#071019;color:#eef6ff;font-family:Arial;padding:14px}.w
 <div id="btSummary" class="c grid"></div>
 <div class="c scroll"><h3>TP Comparison — Strict G2 Close &gt; G1 High</h3>
 <table><thead><tr><th>TP</th><th>Trades</th><th>Wins</th><th>Losses</th><th>Win Rate</th><th>TP Hits</th><th>Net P/L $</th><th>End Balance</th></tr></thead><tbody id=tpc></tbody></table></div>
+<div class="c scroll"><h3>Auto Optimizer — Top Results</h3>
+<div id=optBest class=sub></div>
+<table><thead><tr><th>Rank</th><th>Confirmation</th><th>G2 Body</th><th>TP</th><th>Trades</th><th>Win Rate</th><th>TP Hits</th><th>Net P/L</th><th>End Balance</th></tr></thead><tbody id=optb></tbody></table></div>
 <div class="c scroll"><h3>Month-wise Result</h3><table><thead><tr><th>Month</th><th>Trades</th><th>Wins</th><th>Losses</th><th>P/L $</th><th>End Balance</th></tr></thead><tbody id="mb"></tbody></table></div>
 <div class="c scroll"><h3>Backtest Trades</h3><table><thead><tr><th>Date</th><th>Coin</th><th>Rank</th><th>Vol Upside</th><th>Entry</th><th>SL</th><th>Qty</th><th>Risk $</th><th>Exit</th><th>Reason</th><th>P/L $</th><th>Balance</th></tr></thead><tbody id="btb"></tbody></table></div></div>
 </div><script>
 const f=(x,n=4)=>Number(x||0).toFixed(n);function showTab(x){live.className='pane'+(x==='live'?' on':'');bt.className='pane'+(x==='bt'?' on':'');tLive.className='tab'+(x==='live'?' on':'');tBt.className='tab'+(x==='bt'?' on':'');}
 async function load(){try{let j=await(await fetch('/api/status',{cache:'no-store'})).json();liveMsg.textContent='Last scan: '+(j.last_scan||'—')+(j.last_error?' | '+j.last_error:'');if(j.position){let p=j.position;pos.innerHTML=`<b class=g>OPEN:</b> ${p.instId} | Rank #${p.rank} | Entry ${f(p.entry,6)} | SL ${f(p.sl,6)} | Qty ${f(p.qty,4)} | Risk $${f(p.planned_risk_usd,2)} | Notional $${f(p.notional,2)} | TP ${f(p.tp,6)}`}else pos.innerHTML='<span class=y>No open trade</span>';cb.innerHTML='';(j.candidates||[]).forEach(x=>cb.innerHTML+=`<tr><td>${x.instId}</td><td>#${x.rank}</td><td>${f(x.volume_upside_pct,2)}%</td><td>${f(x.d2_high,6)}</td><td>${f(x.last,6)}</td><td class="${x.breakout?'g':'r'}">${x.breakout?'YES':'NO'}</td></tr>`);tb.innerHTML='';(j.top25||[]).forEach(x=>tb.innerHTML+=`<tr><td>${x.instId}</td><td>#${x.rank}</td><td>${f(x.volume_upside_pct,2)}%</td><td>${f(x.prev_quote_volume,0)}</td></tr>`);trb.innerHTML='';[...(j.trades||[])].reverse().forEach(x=>trb.innerHTML+=`<tr><td>${x.instId}</td><td>#${x.rank}</td><td>${f(x.entry,6)}</td><td>${f(x.exit,6)}</td><td>${x.exit_reason}</td><td class="${x.pnl_usd_gross>=0?'g':'r'}">${f(x.pnl_usd_gross,2)}</td></tr>`);let b=j.backtest||{};btMsg.textContent=(b.running?'Running: ':'')+(b.progress||'')+(b.error?' | '+b.error:'');if(b.result)renderBacktest(b.result);}catch(e){}}
-async function scanNow(){liveMsg.textContent='Scanning...';await fetch('/api/scan-now');await load();}async function startBacktest(){let d=parseInt(days.value||180);btMsg.textContent='Starting...';await fetch('/api/backtest',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({days:d})});showTab('bt');setTimeout(load,1000);}
+async function scanNow(){liveMsg.textContent='Scanning...';await fetch('/api/scan-now');await load();}async function startOptimizer(){
+ let d=parseInt(days.value||180);btMsg.textContent='Optimizer starting...';
+ await fetch('/api/optimize',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({days:d})});
+ showTab('bt');setTimeout(load,1000);
+}
+async function startBacktest(){let d=parseInt(days.value||180);btMsg.textContent='Starting...';await fetch('/api/backtest',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({days:d})});showTab('bt');setTimeout(load,1000);}
+function renderOptimizer(r){
+ optb.innerHTML='';let best=r.best;
+ optBest.innerHTML=best?`<b class="g">BEST:</b> ${best.confirmation} | G2 body ${best.g2_body_max_pct} | TP ${best.tp_pct}% | ${best.trades} trades | Net $${f(best.net_pnl_usd,2)} | End $${f(best.ending_balance,2)}`:'No result';
+ (r.top20||[]).forEach((x,i)=>optb.innerHTML+=`<tr><td>#${i+1}</td><td>${x.confirmation}</td><td>${x.g2_body_max_pct}</td><td>${x.tp_pct}%</td><td>${x.trades}</td><td>${f(x.win_rate_pct,1)}%</td><td>${x.tp_hits}</td><td class="${x.net_pnl_usd>=0?'g':'r'}">${f(x.net_pnl_usd,2)}</td><td>${f(x.ending_balance,2)}</td></tr>`);
+ btSummary.innerHTML=best?`<div class=k><div class=sub>Variants</div><div class=v>${r.variants_tested}</div></div><div class=k><div class=sub>Best Trades</div><div class=v>${best.trades}</div></div><div class=k><div class=sub>Best Win Rate</div><div class=v>${f(best.win_rate_pct,1)}%</div></div><div class=k><div class=sub>Best Net P/L</div><div class="v ${best.net_pnl_usd>=0?'g':'r'}">$${f(best.net_pnl_usd,2)}</div></div><div class=k><div class=sub>Best End</div><div class=v>$${f(best.ending_balance,2)}</div></div>`:'';
+ mb.innerHTML='';btb.innerHTML='';
+}
 function renderBacktest(r){tpc.innerHTML='';(r.tp_comparison||[]).forEach(x=>tpc.innerHTML+=`<tr><td>${x.tp_pct}%</td><td>${x.trades}</td><td>${x.wins}</td><td>${x.losses}</td><td>${f(x.win_rate_pct,1)}%</td><td>${x.tp_hits}</td><td class="${x.net_pnl_usd>=0?'g':'r'}">${f(x.net_pnl_usd,2)}</td><td>${f(x.ending_balance,2)}</td></tr>`);btSummary.innerHTML=`<div class=k><div class=sub>Total Trades</div><div class=v>${r.total_trades}</div></div><div class=k><div class=sub>Win Rate</div><div class=v>${f(r.win_rate_pct,1)}%</div></div><div class=k><div class=sub>TP20 Hits</div><div class=v>${r.tp20_hits}</div></div><div class=k><div class=sub>Net P/L</div><div class="v ${r.net_pnl_usd_gross>=0?'g':'r'}">$${f(r.net_pnl_usd_gross,2)}</div></div><div class=k><div class=sub>End Balance</div><div class=v>$${f(r.ending_balance_gross,2)}</div></div>`;mb.innerHTML='';(r.months||[]).forEach(x=>mb.innerHTML+=`<tr><td>${x.month}</td><td>${x.trades}</td><td>${x.wins}</td><td>${x.losses}</td><td class="${x.pnl_usd>=0?'g':'r'}">${f(x.pnl_usd,2)}</td><td>${f(x.ending_balance,2)}</td></tr>`);btb.innerHTML='';[...(r.trades||[])].reverse().forEach(x=>btb.innerHTML+=`<tr><td>${x.date}</td><td>${x.coin}</td><td>#${x.rank}</td><td>${f(x.volume_upside_pct,2)}%</td><td>${f(x.entry,6)}</td><td>${f(x.sl,6)}</td><td>${f(x.qty,4)}</td><td>${f(x.planned_risk_usd,2)}</td><td>${f(x.exit,6)}</td><td>${x.exit_reason}</td><td class="${x.pnl_usd>=0?'g':'r'}">${f(x.pnl_usd,2)}</td><td>${f(x.balance_after,2)}</td></tr>`);}
 load();setInterval(load,15000);
 </script></body></html>'''
