@@ -10,6 +10,7 @@ MARGIN_PER_TRADE = 100.0
 LEVERAGE = 5.0
 NOTIONAL = MARGIN_PER_TRADE * LEVERAGE
 TP_PCT = 20.0
+TP_TESTS = [3.0, 5.0, 8.0, 10.0, 20.0]
 MAX_RISK_USD = 10.0
 TOP_N = 25
 MIN_DAILY_QUOTE_VOL = 1_000_000.0
@@ -438,6 +439,10 @@ def do_backtest(days):
                 if g2 is None:
                     continue
 
+                # New quality filter: Green #2 must close above Green #1 high.
+                if g2["c"] <= g1["h"]:
+                    continue
+
                 g2_body = green_body_pct(g2)
                 if g2_body <= 1.0:
                     entry = g2["c"]
@@ -462,33 +467,43 @@ def do_backtest(days):
                 qty = min(risk_qty, max_qty)
                 actual_notional = qty * entry
                 planned_risk = qty * risk_per_coin
-                tp = entry * (1 + TP_PCT / 100.0)
+                outcomes = {}
+                for tp_pct in TP_TESTS:
+                    tp = entry * (1 + tp_pct / 100.0)
+                    exit_px = d3["c"]
+                    exit_reason = "DAY_END"
+                    for b15 in bars15:
+                        if b15["ts"] <= entry_ts:
+                            continue
+                        if b15["l"] <= sl:
+                            exit_px = sl
+                            exit_reason = "SL_D2_LOW"
+                            break
+                        if b15["h"] >= tp:
+                            exit_px = tp
+                            exit_reason = f"TP{tp_pct:g}"
+                            break
+                    pnl = qty * (exit_px - entry)
+                    outcomes[str(tp_pct)] = {
+                        "exit": exit_px,
+                        "exit_reason": exit_reason,
+                        "pnl_usd": pnl
+                    }
 
-                exit_px = d3["c"]
-                exit_reason = "DAY_END"
-                for b15 in bars15:
-                    if b15["ts"] <= entry_ts:
-                        continue
-                    if b15["l"] <= sl:
-                        exit_px = sl
-                        exit_reason = "SL_D2_LOW"
-                        break
-                    if b15["h"] >= tp:
-                        exit_px = tp
-                        exit_reason = "TP20"
-                        break
-
-                pnl = qty * (exit_px - entry)
+                # Keep TP20 as the detailed-trade view for backward compatibility.
+                base = outcomes[str(TP_PCT)]
                 candidates.append({
                     "date": datetime.fromtimestamp(d3_ts / 1000, tz=timezone.utc).date().isoformat(),
                     "coin": iid, "rank": rank, "volume_upside_pct": upside,
                     "entry": entry, "entry_15m_ts": entry_ts,
                     "entry_mode": entry_mode, "green2_body_pct": g2_body,
+                    "g1_high": g1["h"], "g2_close": g2["c"],
                     "sl": sl, "qty": qty,
                     "notional": actual_notional, "planned_risk_usd": planned_risk,
-                    "exit": exit_px, "exit_reason": exit_reason,
-                    "pnl_usd": pnl,
-                    "return_on_margin_pct": pnl / MARGIN_PER_TRADE * 100.0
+                    "exit": base["exit"], "exit_reason": base["exit_reason"],
+                    "pnl_usd": base["pnl_usd"],
+                    "return_on_margin_pct": base["pnl_usd"] / MARGIN_PER_TRADE * 100.0,
+                    "tp_outcomes": outcomes
                 })
 
             if not candidates:
@@ -522,6 +537,25 @@ def do_backtest(days):
         tp_hits = sum(1 for t in trades if t["exit_reason"] == "TP20")
         pnl_total = sum(t["pnl_usd"] for t in trades)
 
+        tp_comparison = []
+        for tp_pct in TP_TESTS:
+            key = str(tp_pct)
+            vals = [t["tp_outcomes"][key]["pnl_usd"] for t in trades]
+            w = sum(1 for v in vals if v > 0)
+            l = sum(1 for v in vals if v < 0)
+            hits = sum(1 for t in trades if t["tp_outcomes"][key]["exit_reason"].startswith("TP"))
+            total = sum(vals)
+            tp_comparison.append({
+                "tp_pct": tp_pct,
+                "trades": len(vals),
+                "wins": w,
+                "losses": l,
+                "win_rate_pct": (w / len(vals) * 100.0) if vals else 0.0,
+                "tp_hits": hits,
+                "net_pnl_usd": total,
+                "ending_balance": START_BALANCE + total
+            })
+
         result = {
             "days_requested": days,
             "starting_balance": START_BALANCE,
@@ -538,8 +572,9 @@ def do_backtest(days):
             "net_pnl_usd_gross": pnl_total,
             "ending_balance_gross": START_BALANCE + pnl_total,
             "months": month_rows,
+            "tp_comparison": tp_comparison,
             "trades": trades,
-            "note": "Historical backtest uses completed OKX 1D UTC candles. Fixed $500 notional/trade. Fees/slippage not deducted yet."
+            "note": "Strict filter added: Green #2 close must be above Green #1 high. TP comparison 3/5/8/10/20%. Fees/slippage not deducted yet."
         }
         with lock:
             state["backtest"]["result"] = result
@@ -605,13 +640,16 @@ body{margin:0;background:#071019;color:#eef6ff;font-family:Arial;padding:14px}.w
 <div class="c scroll"><h3>Previous-Day Top 25</h3><table><thead><tr><th>Coin</th><th>Rank</th><th>Vol Upside</th><th>Quote Volume</th></tr></thead><tbody id="tb"></tbody></table></div>
 <div class="c scroll"><h3>Live Paper Trades</h3><table><thead><tr><th>Coin</th><th>Rank</th><th>Entry</th><th>SL</th><th>Qty</th><th>Risk $</th><th>Exit</th><th>Reason</th><th>P/L $</th></tr></thead><tbody id="trb"></tbody></table></div></div>
 <div id="bt" class="pane"><div class="c"><h3>Historical Backtest</h3><div class="sub">Recommended 180 days. First run thora time le sakta hai.</div><br>Days: <input id="days" type="number" value="180" min="30" max="190"> <button onclick="startBacktest()">Run Backtest</button><div id="btMsg" class="sub" style="margin-top:10px"></div></div>
-<div id="btSummary" class="c grid"></div><div class="c scroll"><h3>Month-wise Result</h3><table><thead><tr><th>Month</th><th>Trades</th><th>Wins</th><th>Losses</th><th>P/L $</th><th>End Balance</th></tr></thead><tbody id="mb"></tbody></table></div>
+<div id="btSummary" class="c grid"></div>
+<div class="c scroll"><h3>TP Comparison — Strict G2 Close &gt; G1 High</h3>
+<table><thead><tr><th>TP</th><th>Trades</th><th>Wins</th><th>Losses</th><th>Win Rate</th><th>TP Hits</th><th>Net P/L $</th><th>End Balance</th></tr></thead><tbody id=tpc></tbody></table></div>
+<div class="c scroll"><h3>Month-wise Result</h3><table><thead><tr><th>Month</th><th>Trades</th><th>Wins</th><th>Losses</th><th>P/L $</th><th>End Balance</th></tr></thead><tbody id="mb"></tbody></table></div>
 <div class="c scroll"><h3>Backtest Trades</h3><table><thead><tr><th>Date</th><th>Coin</th><th>Rank</th><th>Vol Upside</th><th>Entry</th><th>SL</th><th>Qty</th><th>Risk $</th><th>Exit</th><th>Reason</th><th>P/L $</th><th>Balance</th></tr></thead><tbody id="btb"></tbody></table></div></div>
 </div><script>
 const f=(x,n=4)=>Number(x||0).toFixed(n);function showTab(x){live.className='pane'+(x==='live'?' on':'');bt.className='pane'+(x==='bt'?' on':'');tLive.className='tab'+(x==='live'?' on':'');tBt.className='tab'+(x==='bt'?' on':'');}
 async function load(){try{let j=await(await fetch('/api/status',{cache:'no-store'})).json();liveMsg.textContent='Last scan: '+(j.last_scan||'—')+(j.last_error?' | '+j.last_error:'');if(j.position){let p=j.position;pos.innerHTML=`<b class=g>OPEN:</b> ${p.instId} | Rank #${p.rank} | Entry ${f(p.entry,6)} | SL ${f(p.sl,6)} | Qty ${f(p.qty,4)} | Risk $${f(p.planned_risk_usd,2)} | Notional $${f(p.notional,2)} | TP ${f(p.tp,6)}`}else pos.innerHTML='<span class=y>No open trade</span>';cb.innerHTML='';(j.candidates||[]).forEach(x=>cb.innerHTML+=`<tr><td>${x.instId}</td><td>#${x.rank}</td><td>${f(x.volume_upside_pct,2)}%</td><td>${f(x.d2_high,6)}</td><td>${f(x.last,6)}</td><td class="${x.breakout?'g':'r'}">${x.breakout?'YES':'NO'}</td></tr>`);tb.innerHTML='';(j.top25||[]).forEach(x=>tb.innerHTML+=`<tr><td>${x.instId}</td><td>#${x.rank}</td><td>${f(x.volume_upside_pct,2)}%</td><td>${f(x.prev_quote_volume,0)}</td></tr>`);trb.innerHTML='';[...(j.trades||[])].reverse().forEach(x=>trb.innerHTML+=`<tr><td>${x.instId}</td><td>#${x.rank}</td><td>${f(x.entry,6)}</td><td>${f(x.exit,6)}</td><td>${x.exit_reason}</td><td class="${x.pnl_usd_gross>=0?'g':'r'}">${f(x.pnl_usd_gross,2)}</td></tr>`);let b=j.backtest||{};btMsg.textContent=(b.running?'Running: ':'')+(b.progress||'')+(b.error?' | '+b.error:'');if(b.result)renderBacktest(b.result);}catch(e){}}
 async function scanNow(){liveMsg.textContent='Scanning...';await fetch('/api/scan-now');await load();}async function startBacktest(){let d=parseInt(days.value||180);btMsg.textContent='Starting...';await fetch('/api/backtest',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({days:d})});showTab('bt');setTimeout(load,1000);}
-function renderBacktest(r){btSummary.innerHTML=`<div class=k><div class=sub>Total Trades</div><div class=v>${r.total_trades}</div></div><div class=k><div class=sub>Win Rate</div><div class=v>${f(r.win_rate_pct,1)}%</div></div><div class=k><div class=sub>TP20 Hits</div><div class=v>${r.tp20_hits}</div></div><div class=k><div class=sub>Net P/L</div><div class="v ${r.net_pnl_usd_gross>=0?'g':'r'}">$${f(r.net_pnl_usd_gross,2)}</div></div><div class=k><div class=sub>End Balance</div><div class=v>$${f(r.ending_balance_gross,2)}</div></div>`;mb.innerHTML='';(r.months||[]).forEach(x=>mb.innerHTML+=`<tr><td>${x.month}</td><td>${x.trades}</td><td>${x.wins}</td><td>${x.losses}</td><td class="${x.pnl_usd>=0?'g':'r'}">${f(x.pnl_usd,2)}</td><td>${f(x.ending_balance,2)}</td></tr>`);btb.innerHTML='';[...(r.trades||[])].reverse().forEach(x=>btb.innerHTML+=`<tr><td>${x.date}</td><td>${x.coin}</td><td>#${x.rank}</td><td>${f(x.volume_upside_pct,2)}%</td><td>${f(x.entry,6)}</td><td>${f(x.sl,6)}</td><td>${f(x.qty,4)}</td><td>${f(x.planned_risk_usd,2)}</td><td>${f(x.exit,6)}</td><td>${x.exit_reason}</td><td class="${x.pnl_usd>=0?'g':'r'}">${f(x.pnl_usd,2)}</td><td>${f(x.balance_after,2)}</td></tr>`);}
+function renderBacktest(r){tpc.innerHTML='';(r.tp_comparison||[]).forEach(x=>tpc.innerHTML+=`<tr><td>${x.tp_pct}%</td><td>${x.trades}</td><td>${x.wins}</td><td>${x.losses}</td><td>${f(x.win_rate_pct,1)}%</td><td>${x.tp_hits}</td><td class="${x.net_pnl_usd>=0?'g':'r'}">${f(x.net_pnl_usd,2)}</td><td>${f(x.ending_balance,2)}</td></tr>`);btSummary.innerHTML=`<div class=k><div class=sub>Total Trades</div><div class=v>${r.total_trades}</div></div><div class=k><div class=sub>Win Rate</div><div class=v>${f(r.win_rate_pct,1)}%</div></div><div class=k><div class=sub>TP20 Hits</div><div class=v>${r.tp20_hits}</div></div><div class=k><div class=sub>Net P/L</div><div class="v ${r.net_pnl_usd_gross>=0?'g':'r'}">$${f(r.net_pnl_usd_gross,2)}</div></div><div class=k><div class=sub>End Balance</div><div class=v>$${f(r.ending_balance_gross,2)}</div></div>`;mb.innerHTML='';(r.months||[]).forEach(x=>mb.innerHTML+=`<tr><td>${x.month}</td><td>${x.trades}</td><td>${x.wins}</td><td>${x.losses}</td><td class="${x.pnl_usd>=0?'g':'r'}">${f(x.pnl_usd,2)}</td><td>${f(x.ending_balance,2)}</td></tr>`);btb.innerHTML='';[...(r.trades||[])].reverse().forEach(x=>btb.innerHTML+=`<tr><td>${x.date}</td><td>${x.coin}</td><td>#${x.rank}</td><td>${f(x.volume_upside_pct,2)}%</td><td>${f(x.entry,6)}</td><td>${f(x.sl,6)}</td><td>${f(x.qty,4)}</td><td>${f(x.planned_risk_usd,2)}</td><td>${f(x.exit,6)}</td><td>${x.exit_reason}</td><td class="${x.pnl_usd>=0?'g':'r'}">${f(x.pnl_usd,2)}</td><td>${f(x.balance_after,2)}</td></tr>`);}
 load();setInterval(load,15000);
 </script></body></html>'''
 
