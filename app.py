@@ -13,6 +13,7 @@ SLIP = 0.0001      # 0.01% per side
 RSI_LEN = 14
 RSI_LOW = 50.0
 RSI_HIGH = 60.0
+MAX_DOLLAR_LOSS = 10.0
 
 def get_all_usdt_spot_pairs():
     """All currently LIVE OKX USDT spot pairs, excluding stablecoin/fiat-like bases."""
@@ -117,6 +118,28 @@ def rsi_series(closes, n=14):
         out[i] = 100.0 if al == 0 else 100 - 100/(1+rs)
     return out
 
+
+def dollar_stop_raw(entry_raw, entry_exec, qty):
+    """
+    Long-position stop price chosen so estimated total loss, including
+    entry/exit fees and exit slippage, is approximately MAX_DOLLAR_LOSS.
+    exit_exec = stop_raw * (1-SLIP)
+    loss = qty*(entry_exec-exit_exec) + fees
+    """
+    if qty <= 0:
+        return 0.0
+    # Solve:
+    # MAX = q*(entry_exec - x*(1-SLIP))
+    #       + FEE*q*entry_exec + FEE*q*x*(1-SLIP)
+    # => MAX/q = entry_exec*(1+FEE) - x*(1-SLIP)*(1-FEE)
+    per_unit = MAX_DOLLAR_LOSS / qty
+    num = entry_exec*(1+FEE) - per_unit
+    den = (1-SLIP)*(1-FEE)
+    if den <= 0:
+        return 0.0
+    x = num/den
+    return max(0.0, min(x, entry_raw))
+
 def build_coin_rows(inst, bars):
     closes = [x["c"] for x in bars]
     rsis = rsi_series(closes, RSI_LEN)
@@ -186,9 +209,12 @@ def simulate(cache, period_days, tp_pct):
                 exit_reason = None
                 tp_raw = open_pos["entry_raw"] * (1 + tp_pct/100.0)
 
-                # Fixed TP: if the day's HIGH touches the selected target,
-                # close at the TP level. Otherwise apply the user's day-end rules.
-                if row["h"] >= tp_raw:
+                # Intraday dollar stop has priority. Once hit, trade is closed;
+                # a later rebound the same day does not reopen it.
+                if row["l"] <= open_pos["stop_raw"]:
+                    exit_reason = "$10 MAX LOSS SL"
+                    exit_exec = open_pos["stop_raw"] * (1-SLIP)
+                elif row["h"] >= tp_raw:
                     exit_reason = f"TP {tp_pct:g}%"
                     exit_exec = tp_raw * (1-SLIP)
                 elif row["rsi"] is not None and row["rsi"] < 50.0:
@@ -250,7 +276,10 @@ def simulate(cache, period_days, tp_pct):
                 row = e
                 exit_reason = None
                 tp_raw = entry_raw * (1 + tp_pct/100.0)
-                if row["h"] >= tp_raw:
+                if row["l"] <= open_pos["stop_raw"]:
+                    exit_reason = "$10 MAX LOSS SL"
+                    exit_exec = open_pos["stop_raw"]*(1-SLIP)
+                elif row["h"] >= tp_raw:
                     exit_reason = f"TP {tp_pct:g}%"
                     exit_exec = tp_raw*(1-SLIP)
                 elif row["rsi"] is not None and row["rsi"] < 50.0:
@@ -300,6 +329,7 @@ def simulate(cache, period_days, tp_pct):
     tp_hits = sum(1 for t in trades if str(t["reason"]).startswith("TP "))
     profit_exits = sum(1 for t in trades if t["reason"] == "PROFIT EOD")
     rsi_exits = sum(1 for t in trades if t["reason"] == "RSI<50 SL")
+    dollar_sl_exits = sum(1 for t in trades if t["reason"] == "$10 MAX LOSS SL")
     net = equity-START_CAPITAL
 
     return {
@@ -312,6 +342,7 @@ def simulate(cache, period_days, tp_pct):
         "tp_hits":tp_hits,
         "profit_exits":profit_exits,
         "rsi_sl_exits":rsi_exits,
+        "dollar_sl_exits":dollar_sl_exits,
         "net_pnl":net,
         "end_balance":equity,
         "max_dd":max_dd,
@@ -451,7 +482,7 @@ th:first-child,td:first-child{text-align:left}.scroll{overflow:auto}.g{color:#6f
 <div class="c scroll">
 <h3>Results</h3>
 <table><thead><tr>
-<th>TP</th><th>Days</th><th>Trades</th><th>Win Rate</th><th>TP Hits</th><th>EOD Profit</th><th>RSI SL</th><th>Net P/L</th><th>End</th><th>Max DD</th><th>Open</th>
+<th>TP</th><th>Days</th><th>Trades</th><th>Win Rate</th><th>TP Hits</th><th>EOD Profit</th><th>$10 SL</th><th>RSI SL</th><th>Net P/L</th><th>End</th><th>Max DD</th><th>Open</th>
 </tr></thead><tbody id=tb></tbody></table>
 </div>
 
@@ -476,7 +507,7 @@ async function load(){
    j.result.results.forEach(x=>{
     tb.innerHTML+=`<tr>
     <td>${f(x.tp_pct,0)}%</td><td>${x.days}</td><td>${x.trades}</td><td>${f(x.win_rate,1)}%</td>
-    <td>${x.tp_hits}</td><td>${x.profit_exits}</td><td>${x.rsi_sl_exits}</td>
+    <td>${x.tp_hits}</td><td>${x.profit_exits}</td><td>${x.dollar_sl_exits||0}</td><td>${x.rsi_sl_exits}</td>
     <td class="${x.net_pnl>=0?'g':'r'}">$${f(x.net_pnl)}</td>
     <td>$${f(x.end_balance)}</td><td>${f(x.max_dd,1)}%</td>
     <td>${x.open_position||'-'}${x.open_position?' ('+(x.unrealized_pnl>=0?'+':'')+f(x.unrealized_pnl)+')':''}</td>
