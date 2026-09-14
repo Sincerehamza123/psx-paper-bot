@@ -14,11 +14,22 @@ RSI_LEN = 14
 RSI_LOW = 50.0
 RSI_HIGH = 60.0
 
-COINS = [
-    "BTC-USDT","ETH-USDT","SOL-USDT","XRP-USDT","DOGE-USDT",
-    "ADA-USDT","LINK-USDT","AVAX-USDT","SUI-USDT","LTC-USDT",
-    "BCH-USDT","DOT-USDT","NEAR-USDT","APT-USDT","INJ-USDT"
-]
+def get_all_usdt_spot_pairs():
+    """All currently LIVE OKX USDT spot pairs, excluding stablecoin/fiat-like bases."""
+    raw = api_get("/api/v5/public/instruments", {"instType":"SPOT"})
+    exclude = {
+        "USDC","USDT","DAI","FDUSD","TUSD","USDP","EUR","EURT","GBP","AUD",
+        "TRY","BRL","AED","SGD","USD","PYUSD","USDE","USD0"
+    }
+    pairs=[]
+    for x in raw:
+        inst=x.get("instId","")
+        base=x.get("baseCcy","").upper()
+        quote=x.get("quoteCcy","").upper()
+        state_=x.get("state","")
+        if quote=="USDT" and state_=="live" and base not in exclude:
+            pairs.append(inst)
+    return sorted(set(pairs))
 
 state = {
     "test": {
@@ -306,7 +317,7 @@ def simulate(cache, period_days, tp_pct):
         "max_dd":max_dd,
         "open_position": open_pos["coin"] if open_pos else None,
         "unrealized_pnl": unrealized,
-        "recent_trades":trades[-10:]
+        "trades_detail":trades
     }
 
 def run_test(days, tp_levels):
@@ -320,9 +331,13 @@ def run_test(days, tp_levels):
 
         cache={}
         fetch_days=max(days+30, 60)
-        for idx,inst in enumerate(COINS,1):
+        with lock:
+            state["test"]["progress"]="Loading all OKX USDT spot pairs..."
+        coins=get_all_usdt_spot_pairs()
+        total_pairs=len(coins)
+        for idx,inst in enumerate(coins,1):
             with lock:
-                state["test"]["progress"]=f"Downloading daily data {idx}/{len(COINS)} — {inst}"
+                state["test"]["progress"]=f"Scanning all pairs {idx}/{total_pairs} — {inst}"
             try:
                 bars=fetch_daily(inst, fetch_days)
                 if len(bars) >= 20:
@@ -356,6 +371,7 @@ def run_test(days, tp_levels):
                     },
                     "days":days,
                     "tp_levels":tp_levels,
+                    "pairs_found":total_pairs,
                     "coins_loaded":len(cache),
                     "results":results
                 }
@@ -401,7 +417,7 @@ th:first-child,td:first-child{text-align:left}.scroll{overflow:auto}.g{color:#6f
 @media(max-width:650px){.grid{grid-template-columns:1fr}}
 </style></head><body><div class=w>
 <div class=c><h2>Daily Green No-Lower-Wick + RSI Strategy</h2>
-<div class=sub>Ek din mein maximum 1 new trade. Aap backtest days aur TP levels khud select kar sakte hain.</div></div>
+<div class=sub>OKX ke tamam LIVE USDT spot pairs scan honge. Ek din mein maximum 1 new trade. Aap backtest days aur TP levels khud select kar sakte hain.</div></div>
 
 <div class="c grid">
 <div class=k><div class=sub>Signal Candle</div><div class=v>Green + Low ≥ Open</div></div>
@@ -429,6 +445,7 @@ th:first-child,td:first-child{text-align:left}.scroll{overflow:auto}.g{color:#6f
 
 <button style="margin-top:16px" onclick=run()>Run Backtest</button>
 <div id=msg class=sub style="margin-top:12px"></div>
+<div id=pairinfo class=sub style="margin-top:8px"></div>
 </div>
 
 <div class="c scroll">
@@ -437,6 +454,15 @@ th:first-child,td:first-child{text-align:left}.scroll{overflow:auto}.g{color:#6f
 <th>TP</th><th>Days</th><th>Trades</th><th>Win Rate</th><th>TP Hits</th><th>EOD Profit</th><th>RSI SL</th><th>Net P/L</th><th>End</th><th>Max DD</th><th>Open</th>
 </tr></thead><tbody id=tb></tbody></table>
 </div>
+
+<div class="c scroll">
+<h3>Trade Details</h3>
+<div class=sub>Har trade ka pair, signal date, entry date, exit date, entry/exit price, RSI aur P/L.</div>
+<table><thead><tr>
+<th>TP</th><th>Pair</th><th>Signal Date</th><th>Entry Date</th><th>Exit Date</th>
+<th>Entry</th><th>Exit</th><th>Signal RSI</th><th>Exit RSI</th><th>Reason</th><th>P/L</th>
+</tr></thead><tbody id=trades></tbody></table>
+</div>
 </div>
 <script>
 const f=(x,n=2)=>Number(x||0).toFixed(n);
@@ -444,7 +470,9 @@ async function load(){
  const j=await(await fetch('/api/status',{cache:'no-store'})).json();
  msg.textContent=(j.running?'Running: ':'')+(j.progress||'')+(j.error?' | '+j.error:'');
  if(j.result&&j.result.results){
+   pairinfo.textContent=`Pairs found: ${j.result.pairs_found||0} | Pairs with usable history: ${j.result.coins_loaded||0}`;
    tb.innerHTML='';
+   trades.innerHTML='';
    j.result.results.forEach(x=>{
     tb.innerHTML+=`<tr>
     <td>${f(x.tp_pct,0)}%</td><td>${x.days}</td><td>${x.trades}</td><td>${f(x.win_rate,1)}%</td>
@@ -453,6 +481,22 @@ async function load(){
     <td>$${f(x.end_balance)}</td><td>${f(x.max_dd,1)}%</td>
     <td>${x.open_position||'-'}${x.open_position?' ('+(x.unrealized_pnl>=0?'+':'')+f(x.unrealized_pnl)+')':''}</td>
     </tr>`;
+
+    (x.trades_detail||[]).forEach(t=>{
+      trades.innerHTML+=`<tr>
+      <td>${f(x.tp_pct,0)}%</td>
+      <td>${t.coin}</td>
+      <td>${t.signal_day}</td>
+      <td>${t.entry_day}</td>
+      <td>${t.exit_day}</td>
+      <td>${f(t.entry,6)}</td>
+      <td>${f(t.exit,6)}</td>
+      <td>${f(t.signal_rsi,2)}</td>
+      <td>${f(t.exit_rsi,2)}</td>
+      <td>${t.reason}</td>
+      <td class="${t.net>=0?'g':'r'}">$${f(t.net)}</td>
+      </tr>`;
+    });
    });
  }
 }
