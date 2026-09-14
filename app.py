@@ -252,10 +252,12 @@ def run_optimizer(days=90):
             except Exception:
                 pass
 
-        rsi_ranges=[(42,58),(45,60),(48,62),(50,65)]
-        pullbacks=[0.0,0.15,0.30]
-        vols=[0.8,1.0,1.2]
-        modes=["CLOSE_PREV_HIGH","CLOSE_EMA20"]
+        # FAST focused grid: 120 variants instead of 1,440.
+        # Based on the strongest 15-day family so 60-day tests finish much faster.
+        rsi_ranges=[(45,60),(48,62),(50,65)]
+        pullbacks=[0.0]
+        vols=[0.8,1.0]
+        modes=["CLOSE_PREV_HIGH"]
         tps=[0.6,0.8,1.0,1.2,1.5]
         sls=[0.3,0.4,0.5,0.6]
 
@@ -391,15 +393,15 @@ th:first-child,td:first-child{text-align:left}.scroll{overflow:auto}
 @media(max-width:700px){.grid{grid-template-columns:1fr 1fr}}
 </style></head><body><div class=w>
 <div class=c>
-<h2>Trend Pullback Recovery — Auto Backtest</h2>
+<h2>Trend Pullback Recovery — FAST Backtest</h2>
 <div class=sub">Breakout chase nahi. 1H bullish trend ke andar 15m pullback ka wait, phir immediate green recovery par entry. $100 capital, 5x max notional $500, fees + slippage included, max 1 trade/day.</div>
 </div>
 
 <div class=c>
-<h3>Auto Test</h3>
-<div class=sub">1 se 90 days tak jitne din chahein select karein. RSI, pullback depth, recovery type, volume, TP aur SL ke multiple variants automatically test honge.</div><br>
+<h3>Fast Auto Test</h3>
+<div class=sub">1 se 90 days tak jitne din chahein select karein. Fast mode: 120 focused variants test honge. 1,440 wale full test se bohat tez aur Render restart ka chance kam.</div><br>
 Days <input id=days type=number value=15 min=1 max=90 step=1>
-<button onclick=runopt()>Run Auto Backtest</button>
+<button onclick=runopt()>Run Fast Backtest</button>
 <div id=msg class=sub style="margin-top:12px"></div>
 </div>
 
