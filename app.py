@@ -13,7 +13,7 @@ SLIP = 0.0001      # 0.01% per side
 RSI_LEN = 14
 RSI_LOW = 50.0
 RSI_HIGH = 60.0
-MAX_DOLLAR_LOSS = 10.0
+STOP_LOSS_PCT = 5.0
 
 def get_all_usdt_spot_pairs():
     """All currently LIVE OKX USDT spot pairs, excluding stablecoin/fiat-like bases."""
@@ -119,27 +119,6 @@ def rsi_series(closes, n=14):
     return out
 
 
-def dollar_stop_raw(entry_raw, entry_exec, qty):
-    """
-    Long-position stop price chosen so estimated total loss, including
-    entry/exit fees and exit slippage, is approximately MAX_DOLLAR_LOSS.
-    exit_exec = stop_raw * (1-SLIP)
-    loss = qty*(entry_exec-exit_exec) + fees
-    """
-    if qty <= 0:
-        return 0.0
-    # Solve:
-    # MAX = q*(entry_exec - x*(1-SLIP))
-    #       + FEE*q*entry_exec + FEE*q*x*(1-SLIP)
-    # => MAX/q = entry_exec*(1+FEE) - x*(1-SLIP)*(1-FEE)
-    per_unit = MAX_DOLLAR_LOSS / qty
-    num = entry_exec*(1+FEE) - per_unit
-    den = (1-SLIP)*(1-FEE)
-    if den <= 0:
-        return 0.0
-    x = num/den
-    return max(0.0, min(x, entry_raw))
-
 def build_coin_rows(inst, bars):
     closes = [x["c"] for x in bars]
     rsis = rsi_series(closes, RSI_LEN)
@@ -222,7 +201,7 @@ def simulate(cache, period_days, tp_pct):
                 # Intraday dollar stop has priority. Once hit, trade is closed;
                 # a later rebound the same day does not reopen it.
                 if row["l"] <= open_pos["stop_raw"]:
-                    exit_reason = "$10 MAX LOSS SL"
+                    exit_reason = "5% PRICE SL"
                     exit_exec = open_pos["stop_raw"] * (1-SLIP)
                 elif row["h"] >= tp_raw:
                     exit_reason = f"TP {tp_pct:g}%"
@@ -271,7 +250,7 @@ def simulate(cache, period_days, tp_pct):
             notional = min(START_CAPITAL*LEVERAGE, equity*LEVERAGE)
             if notional > 0:
                 qty = notional/entry_exec
-                stop_raw = dollar_stop_raw(entry_raw, entry_exec, qty)
+                stop_raw = entry_raw * (1 - STOP_LOSS_PCT/100.0)
                 open_pos = {
                     "coin":pick["coin"],
                     "signal_day":pick["signal"]["day"],
@@ -289,7 +268,7 @@ def simulate(cache, period_days, tp_pct):
                 exit_reason = None
                 tp_raw = entry_raw * (1 + tp_pct/100.0)
                 if row["l"] <= open_pos["stop_raw"]:
-                    exit_reason = "$10 MAX LOSS SL"
+                    exit_reason = "5% PRICE SL"
                     exit_exec = open_pos["stop_raw"]*(1-SLIP)
                 elif row["h"] >= tp_raw:
                     exit_reason = f"TP {tp_pct:g}%"
@@ -341,7 +320,7 @@ def simulate(cache, period_days, tp_pct):
     tp_hits = sum(1 for t in trades if str(t["reason"]).startswith("TP "))
     profit_exits = sum(1 for t in trades if t["reason"] == "PROFIT EOD")
     rsi_exits = sum(1 for t in trades if t["reason"] == "RSI<50 SL")
-    dollar_sl_exits = sum(1 for t in trades if t["reason"] == "$10 MAX LOSS SL")
+    dollar_sl_exits = sum(1 for t in trades if t["reason"] == "5% PRICE SL")
     net = equity-START_CAPITAL
 
     return {
@@ -495,7 +474,7 @@ th:first-child,td:first-child{text-align:left}.scroll{overflow:auto}.g{color:#6f
 <div class="c scroll">
 <h3>Results</h3>
 <table><thead><tr>
-<th>TP</th><th>Days</th><th>Trades</th><th>Win Rate</th><th>TP Hits</th><th>EOD Profit</th><th>$10 SL</th><th>RSI SL</th><th>Net P/L</th><th>End</th><th>Max DD</th><th>Open</th>
+<th>TP</th><th>Days</th><th>Trades</th><th>Win Rate</th><th>TP Hits</th><th>EOD Profit</th><th>5% SL</th><th>RSI SL</th><th>Net P/L</th><th>End</th><th>Max DD</th><th>Open</th>
 </tr></thead><tbody id=tb></tbody></table>
 </div>
 
