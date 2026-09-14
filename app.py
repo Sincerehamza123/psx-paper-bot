@@ -206,9 +206,6 @@ def simulate(cache, period_days, tp_pct):
                 elif row["h"] >= tp_raw:
                     exit_reason = f"TP {tp_pct:g}%"
                     exit_exec = tp_raw * (1-SLIP)
-                elif row["rsi"] is not None and row["rsi"] < 50.0:
-                    exit_reason = "RSI<50 SL"
-                    exit_exec = row["c"] * (1-SLIP)
                 elif row["c"] > open_pos["entry_raw"]:
                     exit_reason = "PROFIT EOD"
                     exit_exec = row["c"] * (1-SLIP)
@@ -273,9 +270,6 @@ def simulate(cache, period_days, tp_pct):
                 elif row["h"] >= tp_raw:
                     exit_reason = f"TP {tp_pct:g}%"
                     exit_exec = tp_raw*(1-SLIP)
-                elif row["rsi"] is not None and row["rsi"] < 50.0:
-                    exit_reason = "RSI<50 SL"
-                    exit_exec = row["c"]*(1-SLIP)
                 elif row["c"] > entry_raw:
                     exit_reason = "PROFIT EOD"
                     exit_exec = row["c"]*(1-SLIP)
@@ -319,7 +313,6 @@ def simulate(cache, period_days, tp_pct):
     losses = sum(1 for t in trades if t["net"] <= 0)
     tp_hits = sum(1 for t in trades if str(t["reason"]).startswith("TP "))
     profit_exits = sum(1 for t in trades if t["reason"] == "PROFIT EOD")
-    rsi_exits = sum(1 for t in trades if t["reason"] == "RSI<50 SL")
     dollar_sl_exits = sum(1 for t in trades if t["reason"] == "5% PRICE SL")
     net = equity-START_CAPITAL
 
@@ -332,7 +325,6 @@ def simulate(cache, period_days, tp_pct):
         "win_rate":wins/len(trades)*100 if trades else 0,
         "tp_hits":tp_hits,
         "profit_exits":profit_exits,
-        "rsi_sl_exits":rsi_exits,
         "dollar_sl_exits":dollar_sl_exits,
         "net_pnl":net,
         "end_balance":equity,
@@ -474,7 +466,7 @@ th:first-child,td:first-child{text-align:left}.scroll{overflow:auto}.g{color:#6f
 <div class="c scroll">
 <h3>Results</h3>
 <table><thead><tr>
-<th>TP</th><th>Days</th><th>Trades</th><th>Win Rate</th><th>TP Hits</th><th>EOD Profit</th><th>5% SL</th><th>RSI SL</th><th>Net P/L</th><th>End</th><th>Max DD</th><th>Open</th>
+<th>TP</th><th>Days</th><th>Trades</th><th>Win Rate</th><th>TP Hits</th><th>EOD Profit</th><th>5% SL</th><th>Net P/L</th><th>End</th><th>Max DD</th><th>Open</th>
 </tr></thead><tbody id=tb></tbody></table>
 </div>
 
@@ -499,7 +491,7 @@ async function load(){
    j.result.results.forEach(x=>{
     tb.innerHTML+=`<tr>
     <td>${f(x.tp_pct,0)}%</td><td>${x.days}</td><td>${x.trades}</td><td>${f(x.win_rate,1)}%</td>
-    <td>${x.tp_hits}</td><td>${x.profit_exits}</td><td>${x.dollar_sl_exits||0}</td><td>${x.rsi_sl_exits}</td>
+    <td>${x.tp_hits}</td><td>${x.profit_exits}</td><td>${x.dollar_sl_exits||0}</td>
     <td class="${x.net_pnl>=0?'g':'r'}">$${f(x.net_pnl)}</td>
     <td>$${f(x.end_balance)}</td><td>${f(x.max_dd,1)}%</td>
     <td>${x.open_position||'-'}${x.open_position?' ('+(x.unrealized_pnl>=0?'+':'')+f(x.unrealized_pnl)+')':''}</td>
