@@ -261,6 +261,7 @@ def simulate(cache, period_days, tp_pct):
             notional = min(START_CAPITAL*LEVERAGE, equity*LEVERAGE)
             if notional > 0:
                 qty = notional/entry_exec
+                stop_raw = dollar_stop_raw(entry_raw, entry_exec, qty)
                 open_pos = {
                     "coin":pick["coin"],
                     "signal_day":pick["signal"]["day"],
@@ -269,7 +270,8 @@ def simulate(cache, period_days, tp_pct):
                     "entry_raw":entry_raw,
                     "entry_exec":entry_exec,
                     "qty":qty,
-                    "notional":notional
+                    "notional":notional,
+                    "stop_raw":stop_raw
                 }
 
                 # Entry day itself may qualify for TP or day-end exit.
