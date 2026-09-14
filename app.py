@@ -1,16 +1,18 @@
 
-import os, time, json, threading, urllib.parse, urllib.request
+import json, threading, time, urllib.parse, urllib.request
 from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, Response, request
 
 app = Flask(__name__)
 BASE = "https://www.okx.com"
 
-CAPITAL = 100.0
+START_CAPITAL = 100.0
 LEVERAGE = 5.0
-NOTIONAL = 500.0
-FEE = 0.0005
-SLIP = 0.0001
+FEE = 0.0005       # 0.05% per side
+SLIP = 0.0001      # 0.01% per side
+RSI_LEN = 14
+RSI_LOW = 50.0
+RSI_HIGH = 60.0
 
 COINS = [
     "BTC-USDT","ETH-USDT","SOL-USDT","XRP-USDT","DOGE-USDT",
@@ -19,7 +21,7 @@ COINS = [
 ]
 
 state = {
-    "optimizer": {
+    "test": {
         "running": False,
         "progress": "",
         "result": None,
@@ -29,13 +31,13 @@ state = {
 }
 lock = threading.RLock()
 
-def get(path, params=None, timeout=20):
+def api_get(path, params=None, timeout=25):
     url = BASE + path
     if params:
         url += "?" + urllib.parse.urlencode(params)
     req = urllib.request.Request(url, headers={
-        "User-Agent":"Mozilla/5.0 PullbackRecoveryBot/1.0",
-        "Accept":"application/json"
+        "User-Agent": "Mozilla/5.0 DailyRSINoLowerWick/1.0",
+        "Accept": "application/json"
     })
     with urllib.request.urlopen(req, timeout=timeout) as r:
         obj = json.loads(r.read().decode("utf-8"))
@@ -45,340 +47,424 @@ def get(path, params=None, timeout=20):
 
 def parse_bar(r):
     return {
-        "ts":int(r[0]), "o":float(r[1]), "h":float(r[2]), "l":float(r[3]),
-        "c":float(r[4]), "v":float(r[5]), "qv":float(r[7]), "ok":str(r[8])
+        "ts": int(r[0]),
+        "o": float(r[1]),
+        "h": float(r[2]),
+        "l": float(r[3]),
+        "c": float(r[4]),
+        "v": float(r[5]),
+        "ok": str(r[8]) if len(r) > 8 else "1"
     }
 
-def hist_bars(inst, tf, days):
-    target = int((datetime.now(timezone.utc)-timedelta(days=days+5)).timestamp()*1000)
+def fetch_daily(inst, days=105):
+    target = int((datetime.now(timezone.utc)-timedelta(days=days+30)).timestamp()*1000)
     rows = {}
     after = None
-    for _ in range(160):
-        p={"instId":inst,"bar":tf,"limit":"100"}
+    for _ in range(10):
+        p = {"instId":inst, "bar":"1Dutc", "limit":"100"}
         if after is not None:
-            p["after"]=str(after)
-        raw=get("/api/v5/market/history-candles",p)
+            p["after"] = str(after)
+        raw = api_get("/api/v5/market/history-candles", p)
         if not raw:
             break
-        batch=[parse_bar(x) for x in raw if len(x)>=9]
+        batch = [parse_bar(x) for x in raw if len(x) >= 8]
         if not batch:
             break
         for b in batch:
-            if b["ok"]=="1":
-                rows[b["ts"]]=b
-        oldest=min(x["ts"] for x in batch)
-        if oldest<=target:
+            if b["ok"] == "1":
+                rows[b["ts"]] = b
+        oldest = min(x["ts"] for x in batch)
+        if oldest <= target:
             break
-        after=oldest
-        time.sleep(0.025)
-    out=sorted(rows.values(),key=lambda x:x["ts"])
-    return [x for x in out if x["ts"]>=target]
+        after = oldest
+        time.sleep(0.03)
+    out = sorted(rows.values(), key=lambda x:x["ts"])
+    return [x for x in out if x["ts"] >= target]
 
-def ema_series(vals, n):
-    if len(vals)<n:
-        return []
-    out=[None]*(n-1)
-    e=sum(vals[:n])/n
-    out.append(e)
-    k=2/(n+1)
-    for v in vals[n:]:
-        e=v*k+e*(1-k)
-        out.append(e)
+def date_str(ts):
+    return datetime.fromtimestamp(ts/1000, tz=timezone.utc).date().isoformat()
+
+def rsi_series(closes, n=14):
+    out = [None]*len(closes)
+    if len(closes) < n+1:
+        return out
+    gains = []
+    losses = []
+    for i in range(1, n+1):
+        d = closes[i]-closes[i-1]
+        gains.append(max(d,0))
+        losses.append(max(-d,0))
+    ag = sum(gains)/n
+    al = sum(losses)/n
+    rs = float("inf") if al == 0 else ag/al
+    out[n] = 100.0 if al == 0 else 100 - 100/(1+rs)
+    for i in range(n+1, len(closes)):
+        d = closes[i]-closes[i-1]
+        ag = (ag*(n-1)+max(d,0))/n
+        al = (al*(n-1)+max(-d,0))/n
+        rs = float("inf") if al == 0 else ag/al
+        out[i] = 100.0 if al == 0 else 100 - 100/(1+rs)
     return out
 
-def ema(vals,n):
-    s=ema_series(vals,n)
-    return s[-1] if s else None
-
-def rsi(vals,n=14):
-    if len(vals)<n+1:
-        return None
-    gains=[]; losses=[]
-    for i in range(1,n+1):
-        d=vals[i]-vals[i-1]
-        gains.append(max(d,0)); losses.append(max(-d,0))
-    ag=sum(gains)/n
-    al=sum(losses)/n
-    for i in range(n+1,len(vals)):
-        d=vals[i]-vals[i-1]
-        ag=(ag*(n-1)+max(d,0))/n
-        al=(al*(n-1)+max(-d,0))/n
-    if al==0:
-        return 100.0
-    rs=ag/al
-    return 100-100/(1+rs)
-
-def utc_date(ts):
-    return datetime.fromtimestamp(ts/1000,tz=timezone.utc).date().isoformat()
-
-def max_drawdown(trades):
-    bal=CAPITAL
-    peak=CAPITAL
-    dd=0
-    for t in trades:
-        bal += t["net"]
-        peak=max(peak,bal)
-        if peak>0:
-            dd=max(dd,(peak-bal)/peak*100)
-    return dd, bal
-
-def build_signals(h1, m15, rlo, rhi, pullback_depth, vol_mult, recovery_mode):
-    # Strategy:
-    # 1H: EMA20 > EMA50, close > EMA50, RSI in range.
-    # 15m: pullback candle touches EMA20 zone without losing EMA50 too deeply.
-    # Immediate next 15m candle must recover green.
-    # Recovery modes:
-    #   CLOSE_PREV_HIGH = green closes above pullback candle high
-    #   CLOSE_EMA20 = green closes back above 15m EMA20
-    signals=[]
-    if len(h1)<60 or len(m15)<80:
-        return signals
-
-    closes15=[x["c"] for x in m15]
-    e20s=ema_series(closes15,20)
-    e50s=ema_series(closes15,50)
-
-    for i in range(51,len(m15)-1):
-        pb=m15[i-1]
-        rec=m15[i]
-        e20=e20s[i-1]
-        e50=e50s[i-1]
-        e20r=e20s[i]
-        if e20 is None or e50 is None or e20r is None:
-            continue
-
-        # only historical 1H candles known before recovery close
-        hrs=[x for x in h1 if x["ts"]<rec["ts"]]
-        if len(hrs)<55:
-            continue
-        hc=[x["c"] for x in hrs[-60:]]
-        he20=ema(hc,20)
-        he50=ema(hc,50)
-        rr=rsi(hc[-30:],14)
-        if he20 is None or he50 is None or rr is None:
-            continue
-        if not (he20>he50 and hrs[-1]["c"]>he50 and rlo<=rr<=rhi):
-            continue
-
-        # pullback must be red or weak, touch EMA20 zone, not crash far below EMA50
-        if not (pb["c"]<=pb["o"]):
-            continue
-        touch_limit=e20*(1+pullback_depth/100)
-        if pb["l"]>touch_limit:
-            continue
-        if pb["c"] < e50*0.995:
-            continue
-
-        # recovery candle green + volume
-        if not (rec["c"]>rec["o"]):
-            continue
-        prior=m15[max(0,i-21):i-1]
-        if len(prior)<20:
-            continue
-        avgv=sum(x["v"] for x in prior)/len(prior)
-        if rec["v"] < vol_mult*avgv:
-            continue
-
-        if recovery_mode=="CLOSE_PREV_HIGH":
-            if rec["c"]<=pb["h"]:
-                continue
-        else:
-            if rec["c"]<=e20r:
-                continue
-
-        score=(rec["v"]/avgv if avgv else 0) + max(0,(rr-rlo)/10)
-        signals.append({
-            "day":utc_date(rec["ts"]),
-            "entry_ts":rec["ts"],
-            "entry":rec["c"],
-            "idx":i,
-            "pb_low":pb["l"],
-            "score":score,
-            "rsi":rr,
-            "volx":rec["v"]/avgv if avgv else 0
+def build_coin_rows(inst, bars):
+    closes = [x["c"] for x in bars]
+    rsis = rsi_series(closes, RSI_LEN)
+    rows = []
+    for i,b in enumerate(bars):
+        rows.append({
+            **b,
+            "coin":inst,
+            "day":date_str(b["ts"]),
+            "rsi":rsis[i],
+            "i":i
         })
-    return signals
+    return rows
 
-def evaluate_signal(sig, m15, tp_pct, sl_pct):
-    entry=sig["entry"]
-    tp=entry*(1+tp_pct/100)
-    pct_sl=entry*(1-sl_pct/100)
-    # Use tighter of fixed SL or pullback low only if pullback low is below entry.
-    structural=sig["pb_low"]
-    sl=max(structural,pct_sl) if structural<entry else pct_sl
+def is_signal(row):
+    # User rule:
+    # 1) Daily candle must be green.
+    # 2) Low must not go below open (no lower wick).
+    #    Small floating tolerance is used for exchange precision.
+    # 3) RSI(14) must be >50 and <60 at day close.
+    tol = max(abs(row["o"])*1e-8, 1e-12)
+    no_lower_wick = row["l"] >= row["o"] - tol
+    return (
+        row["c"] > row["o"] and
+        no_lower_wick and
+        row["rsi"] is not None and
+        RSI_LOW < row["rsi"] < RSI_HIGH
+    )
 
-    qty=NOTIONAL/entry
-    day=sig["day"]
-    exit_px=None
-    reason=None
+def simulate(cache, period_days, tp_pct):
+    cutoff = (datetime.now(timezone.utc).date()-timedelta(days=period_days)).isoformat()
 
-    for j in range(sig["idx"]+1,len(m15)):
-        x=m15[j]
-        if utc_date(x["ts"])!=day:
-            exit_px=m15[j-1]["c"]
-            reason="DAY_END"
-            break
-        # conservative ordering when both touched in same bar
-        if x["l"]<=sl:
-            exit_px=sl
-            reason="SL"
-            break
-        if x["h"]>=tp:
-            exit_px=tp
-            reason="TP"
-            break
+    # Create signal candidates. Since "low never below open" and RSI are only
+    # fully known at day close, entry is NEXT day's open (avoids look-ahead).
+    candidates = {}
+    for inst, rows in cache.items():
+        for i in range(len(rows)-1):
+            s = rows[i]
+            if s["day"] < cutoff:
+                continue
+            if not is_signal(s):
+                continue
+            nxt = rows[i+1]
+            body_pct = (s["c"]-s["o"])/s["o"]*100 if s["o"] else 0
+            candidates.setdefault(nxt["day"], []).append({
+                "coin":inst,
+                "signal":s,
+                "entry_row":nxt,
+                "score":body_pct + (s["rsi"]-50.0)/10.0
+            })
 
-    if exit_px is None:
-        exit_px=m15[-1]["c"]
-        reason="END"
+    equity = START_CAPITAL
+    peak = START_CAPITAL
+    max_dd = 0.0
+    trades = []
+    open_pos = None
 
-    gross=qty*(exit_px-entry)
-    costs=(NOTIONAL+qty*exit_px)*(FEE+SLIP)
-    return gross-costs, reason
+    # unified chronological dates
+    all_days = sorted({r["day"] for rows in cache.values() for r in rows if r["day"] >= cutoff})
 
+    for day in all_days:
+        # First manage open position using this day's close/RSI
+        if open_pos is not None:
+            rows = cache[open_pos["coin"]]
+            row = next((x for x in rows if x["day"] == day), None)
+            if row is not None and row["day"] >= open_pos["entry_day"]:
+                exit_reason = None
+                tp_raw = open_pos["entry_raw"] * (1 + tp_pct/100.0)
 
-# LOCKED setup for validation — no optimizer / no cherry-picking per period.
-LOCK_RSI=(50,65)
-LOCK_PULLBACK=0.0
-LOCK_VOL=0.8
-LOCK_RECOVERY="CLOSE_PREV_HIGH"
-LOCK_TP=1.5
-LOCK_SL=0.6
-TEST_PERIODS=[15,30,60,90]
+                # Fixed TP: if the day's HIGH touches the selected target,
+                # close at the TP level. Otherwise apply the user's day-end rules.
+                if row["h"] >= tp_raw:
+                    exit_reason = f"TP {tp_pct:g}%"
+                    exit_exec = tp_raw * (1-SLIP)
+                elif row["rsi"] is not None and row["rsi"] < 50.0:
+                    exit_reason = "RSI<50 SL"
+                    exit_exec = row["c"] * (1-SLIP)
+                elif row["c"] > open_pos["entry_raw"]:
+                    exit_reason = "PROFIT EOD"
+                    exit_exec = row["c"] * (1-SLIP)
 
-def run_optimizer(days=90):
+                if exit_reason:
+                    qty = open_pos["qty"]
+                    gross = qty*(exit_exec-open_pos["entry_exec"])
+                    fees = FEE*qty*open_pos["entry_exec"] + FEE*qty*exit_exec
+                    net = gross-fees
+                    equity += net
+                    trades.append({
+                        "coin":open_pos["coin"],
+                        "signal_day":open_pos["signal_day"],
+                        "entry_day":open_pos["entry_day"],
+                        "exit_day":day,
+                        "signal_rsi":open_pos["signal_rsi"],
+                        "exit_rsi":row["rsi"],
+                        "entry":open_pos["entry_exec"],
+                        "exit":exit_exec,
+                        "notional":open_pos["notional"],
+                        "net":net,
+                        "reason":exit_reason
+                    })
+                    open_pos = None
+
+                    peak = max(peak, equity)
+                    if peak > 0:
+                        max_dd = max(max_dd, (peak-equity)/peak*100)
+
+        # If flat, allow a new entry at today's open.
+        if open_pos is None and equity > 0 and day in candidates:
+            picks = candidates[day]
+            pick = sorted(picks, key=lambda x:x["score"], reverse=True)[0]
+            e = pick["entry_row"]
+            entry_raw = e["o"]
+            entry_exec = entry_raw*(1+SLIP)
+
+            # Max 5x current equity; this prevents impossible negative leverage.
+            notional = min(START_CAPITAL*LEVERAGE, equity*LEVERAGE)
+            if notional > 0:
+                qty = notional/entry_exec
+                open_pos = {
+                    "coin":pick["coin"],
+                    "signal_day":pick["signal"]["day"],
+                    "signal_rsi":pick["signal"]["rsi"],
+                    "entry_day":day,
+                    "entry_raw":entry_raw,
+                    "entry_exec":entry_exec,
+                    "qty":qty,
+                    "notional":notional
+                }
+
+                # Entry day itself may qualify for TP or day-end exit.
+                row = e
+                exit_reason = None
+                tp_raw = entry_raw * (1 + tp_pct/100.0)
+                if row["h"] >= tp_raw:
+                    exit_reason = f"TP {tp_pct:g}%"
+                    exit_exec = tp_raw*(1-SLIP)
+                elif row["rsi"] is not None and row["rsi"] < 50.0:
+                    exit_reason = "RSI<50 SL"
+                    exit_exec = row["c"]*(1-SLIP)
+                elif row["c"] > entry_raw:
+                    exit_reason = "PROFIT EOD"
+                    exit_exec = row["c"]*(1-SLIP)
+
+                if exit_reason:
+                    gross = qty*(exit_exec-entry_exec)
+                    fees = FEE*qty*entry_exec + FEE*qty*exit_exec
+                    net = gross-fees
+                    equity += net
+                    trades.append({
+                        "coin":open_pos["coin"],
+                        "signal_day":open_pos["signal_day"],
+                        "entry_day":day,
+                        "exit_day":day,
+                        "signal_rsi":open_pos["signal_rsi"],
+                        "exit_rsi":row["rsi"],
+                        "entry":entry_exec,
+                        "exit":exit_exec,
+                        "notional":notional,
+                        "net":net,
+                        "reason":exit_reason
+                    })
+                    open_pos = None
+                    peak = max(peak, equity)
+                    if peak > 0:
+                        max_dd = max(max_dd, (peak-equity)/peak*100)
+
+    # Mark-to-market final open position at last available close so result is honest.
+    unrealized = 0.0
+    if open_pos is not None:
+        rows = cache[open_pos["coin"]]
+        last = next((x for x in reversed(rows) if x["day"] >= open_pos["entry_day"]), None)
+        if last:
+            exit_exec = last["c"]*(1-SLIP)
+            qty = open_pos["qty"]
+            gross = qty*(exit_exec-open_pos["entry_exec"])
+            fees = FEE*qty*open_pos["entry_exec"] + FEE*qty*exit_exec
+            unrealized = gross-fees
+
+    wins = sum(1 for t in trades if t["net"] > 0)
+    losses = sum(1 for t in trades if t["net"] <= 0)
+    tp_hits = sum(1 for t in trades if str(t["reason"]).startswith("TP "))
+    profit_exits = sum(1 for t in trades if t["reason"] == "PROFIT EOD")
+    rsi_exits = sum(1 for t in trades if t["reason"] == "RSI<50 SL")
+    net = equity-START_CAPITAL
+
+    return {
+        "days":period_days,
+        "tp_pct":tp_pct,
+        "trades":len(trades),
+        "wins":wins,
+        "losses":losses,
+        "win_rate":wins/len(trades)*100 if trades else 0,
+        "tp_hits":tp_hits,
+        "profit_exits":profit_exits,
+        "rsi_sl_exits":rsi_exits,
+        "net_pnl":net,
+        "end_balance":equity,
+        "max_dd":max_dd,
+        "open_position": open_pos["coin"] if open_pos else None,
+        "unrealized_pnl": unrealized,
+        "recent_trades":trades[-10:]
+    }
+
+def run_test(days, tp_levels):
     with lock:
-        state["optimizer"]={"running":True,"progress":"Starting fixed validation...","result":None,"error":None,"last_run":None}
+        state["test"]={"running":True,"progress":"Starting...","result":None,"error":None,"last_run":None}
     try:
+        days = max(1, min(int(days), 180))
+        tp_levels = sorted(set(float(x) for x in tp_levels if float(x) in [5,10,15,20,25,30]))
+        if not tp_levels:
+            tp_levels=[5.0]
+
         cache={}
+        fetch_days=max(days+30, 60)
         for idx,inst in enumerate(COINS,1):
             with lock:
-                state["optimizer"]["progress"]=f"Downloading {idx}/{len(COINS)} {inst}"
+                state["test"]["progress"]=f"Downloading daily data {idx}/{len(COINS)} — {inst}"
             try:
-                h1=hist_bars(inst,"1H",95)
-                m15=hist_bars(inst,"15m",95)
-                if len(h1)>=60 and len(m15)>=80:
-                    cache[inst]=(h1,m15)
+                bars=fetch_daily(inst, fetch_days)
+                if len(bars) >= 20:
+                    cache[inst]=build_coin_rows(inst,bars)
             except Exception:
                 pass
 
-        with lock:
-            state["optimizer"]["progress"]="Building locked signals..."
-
-        evaluated=[]
-        for inst,(h1,m15) in cache.items():
-            sigs=build_signals(h1,m15,LOCK_RSI[0],LOCK_RSI[1],LOCK_PULLBACK,LOCK_VOL,LOCK_RECOVERY)
-            for s in sigs:
-                s["coin"]=inst
-                net,reason=evaluate_signal(s,m15,LOCK_TP,LOCK_SL)
-                evaluated.append({
-                    "day":s["day"],"coin":inst,"net":net,"reason":reason,
-                    "score":s["score"],"rsi":s["rsi"],"volx":s["volx"]
-                })
-
         results=[]
-        today=datetime.now(timezone.utc).date()
-        for period in TEST_PERIODS:
-            cutoff=(today-timedelta(days=period)).isoformat()
-            subset=[x for x in evaluated if x["day"]>=cutoff]
-            byday={}
-            for t in subset:
-                byday.setdefault(t["day"],[]).append(t)
-            chosen=[sorted(byday[d],key=lambda x:x["score"],reverse=True)[0] for d in sorted(byday)]
-            wins=sum(1 for x in chosen if x["net"]>0)
-            tph=sum(1 for x in chosen if x["reason"]=="TP")
-            slh=sum(1 for x in chosen if x["reason"]=="SL")
-            dd,endbal=max_drawdown(chosen)
-            n=len(chosen)
-            results.append({
-                "days":period,"trades":n,"wins":wins,"losses":n-wins,
-                "win_rate":(wins/n*100 if n else 0),
-                "tp_hits":tph,"sl_hits":slh,
-                "net_pnl":endbal-CAPITAL,"ending_balance":endbal,
-                "max_drawdown_pct":dd
-            })
+        for tp in tp_levels:
+            with lock:
+                state["test"]["progress"]=f"Testing {days} days — TP {tp:g}%..."
+            results.append(simulate(cache,days,tp))
 
-        result={
-            "locked":{
-                "rsi":"50-65","pullback_pct":LOCK_PULLBACK,"vol_mult":LOCK_VOL,
-                "recovery":LOCK_RECOVERY,"tp_pct":LOCK_TP,"sl_pct":LOCK_SL
-            },
-            "periods":results,
-            "coins_loaded":len(cache),
-            "note":"Same exact setup tested on 15/30/60/90 days. No per-period optimization."
-        }
         with lock:
-            state["optimizer"].update({
-                "running":False,"progress":"Complete","result":result,"error":None,
-                "last_run":datetime.now(timezone.utc).isoformat()
+            state["test"].update({
+                "running":False,
+                "progress":"Complete",
+                "error":None,
+                "last_run":datetime.now(timezone.utc).isoformat(),
+                "result":{
+                    "rules":{
+                        "signal":"Daily green candle; Low >= Open (no lower wick); RSI(14) >50 and <60",
+                        "entry":"Next trading day's OPEN",
+                        "max_trades":"Maximum 1 new trade per day; only 1 global open position at a time",
+                        "tp":"Selected fixed TP: 5/10/15/20/25/30% from entry; hit checked from daily HIGH",
+                        "exit_profit":"If TP is not hit, close at day-end only when Close > entry",
+                        "exit_sl":"If not TP, day-end RSI(14) <50 closes as SL",
+                        "hold":"If not profitable and RSI stays >=50, keep holding",
+                        "capital":"$100 starting equity; max 5x notional",
+                        "costs":"0.05% fee/side + 0.01% slippage/side"
+                    },
+                    "days":days,
+                    "tp_levels":tp_levels,
+                    "coins_loaded":len(cache),
+                    "results":results
+                }
             })
     except Exception as e:
         with lock:
-            state["optimizer"].update({"running":False,"progress":"Failed","error":repr(e)})
+            state["test"].update({"running":False,"progress":"Failed","error":repr(e)})
 
-@app.post("/api/optimize")
-def api_optimize():
+@app.post("/api/run")
+def api_run():
+    data = request.get_json(silent=True) or {}
+    try:
+        days = int(data.get("days",30))
+    except Exception:
+        days = 30
+    tps = data.get("tps",[5])
+    if not isinstance(tps,list):
+        tps=[5]
     with lock:
-        if state["optimizer"]["running"]:
-            return jsonify({"ok":False,"message":"Validation already running"}),409
-        threading.Thread(target=run_optimizer,args=(90,),daemon=True).start()
-    return jsonify({"ok":True})
+        if state["test"]["running"]:
+            return jsonify({"ok":False,"message":"Test already running"}),409
+        threading.Thread(target=run_test,args=(days,tps),daemon=True).start()
+    return jsonify({"ok":True,"days":days,"tps":tps})
 
 @app.get("/api/status")
 def api_status():
     with lock:
-        return jsonify(state)
+        return jsonify(state["test"])
 
-HTML=r"""<!doctype html><html><head>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Locked Pullback Validation</title>
+HTML=r"""<!doctype html>
+<html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RSI No Lower Wick Strategy</title>
 <style>
-body{margin:0;background:#071019;color:#eef6ff;font-family:Arial;padding:14px}.w{max-width:1000px;margin:auto}
-.c{background:#111d29;border:1px solid #27394b;border-radius:14px;padding:16px;margin-bottom:12px}
-.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.k{background:#09141e;padding:11px;border-radius:9px}
-.v{font-size:20px;font-weight:bold}.sub{color:#a8bacb;line-height:1.5}.g{color:#6ff0a0}.r{color:#ff9999}
-button{padding:12px 17px;border:0;border-radius:8px;background:#387df3;color:white;font-weight:bold;font-size:16px}
+body{margin:0;background:#071019;color:#eef6ff;font-family:Arial;padding:14px}
+.w{max-width:1000px;margin:auto}.c{background:#111d29;border:1px solid #27394b;border-radius:14px;padding:16px;margin-bottom:12px}
+.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}.k{background:#09141e;padding:12px;border-radius:9px}
+.sub{color:#a8bacb;line-height:1.5}.v{font-size:18px;font-weight:bold}
+button{padding:13px 18px;border:0;border-radius:9px;background:#387df3;color:white;font-size:16px;font-weight:bold}
+input[type=number]{width:110px;padding:11px;border-radius:8px;border:1px solid #3b4d60;background:#09141e;color:white;font-size:17px}
+.tps{display:flex;flex-wrap:wrap;gap:10px;margin-top:8px}.tp{background:#09141e;padding:10px 12px;border-radius:9px}
 table{width:100%;border-collapse:collapse}th,td{padding:9px;border-bottom:1px solid #253645;text-align:right;white-space:nowrap}
-th:first-child,td:first-child{text-align:left}.scroll{overflow:auto}
-@media(max-width:700px){.grid{grid-template-columns:1fr 1fr}}
+th:first-child,td:first-child{text-align:left}.scroll{overflow:auto}.g{color:#6ff0a0}.r{color:#ff9999}
+@media(max-width:650px){.grid{grid-template-columns:1fr}}
 </style></head><body><div class=w>
-<div class=c>
-<h2>Locked Pullback Recovery — Validation</h2>
-<div class=sub">Ab optimizer har period ke liye rules change nahi karega. Same exact setup 15, 30, 60 aur 90 days par test hoga.</div>
-</div>
+<div class=c><h2>Daily Green No-Lower-Wick + RSI Strategy</h2>
+<div class=sub>Ek din mein maximum 1 new trade. Aap backtest days aur TP levels khud select kar sakte hain.</div></div>
+
 <div class="c grid">
-<div class=k><div class=sub>RSI</div><div class=v>50–65</div></div>
-<div class=k><div class=sub>Pullback</div><div class=v>0%</div></div>
-<div class=k><div class=sub>Volume</div><div class=v>0.8x</div></div>
-<div class=k><div class=sub>Recovery</div><div class=v style="font-size:14px">CLOSE_PREV_HIGH</div></div>
-<div class=k><div class=sub>TP</div><div class=v>1.5%</div></div>
-<div class=k><div class=sub>SL</div><div class=v>0.6%</div></div>
+<div class=k><div class=sub>Signal Candle</div><div class=v>Green + Low ≥ Open</div></div>
+<div class=k><div class=sub>RSI(14)</div><div class=v>&gt; 50 and &lt; 60</div></div>
+<div class=k><div class=sub>Entry</div><div class=v>Next Day Open</div></div>
+<div class=k><div class=sub>Max Trades</div><div class=v>1 new trade / day</div></div>
+<div class=k><div class=sub>Day-end SL</div><div class=v>RSI &lt; 50</div></div>
+<div class=k><div class=sub>Capital</div><div class=v>$100 / max 5x</div></div>
 </div>
+
 <div class=c>
-<button onclick=run()>Run 15/30/60/90 Validation</button>
+<h3>Backtest Settings</h3>
+<div class=sub>Kitne din ka backtest:</div>
+<input id=days type=number value=30 min=1 max=180 step=1>
+
+<div class=sub style="margin-top:14px">TP select karein (ek ya multiple):</div>
+<div class=tps>
+<label class=tp><input type=checkbox name=tp value=5 checked> 5%</label>
+<label class=tp><input type=checkbox name=tp value=10> 10%</label>
+<label class=tp><input type=checkbox name=tp value=15> 15%</label>
+<label class=tp><input type=checkbox name=tp value=20> 20%</label>
+<label class=tp><input type=checkbox name=tp value=25> 25%</label>
+<label class=tp><input type=checkbox name=tp value=30> 30%</label>
+</div>
+
+<button style="margin-top:16px" onclick=run()>Run Backtest</button>
 <div id=msg class=sub style="margin-top:12px"></div>
 </div>
+
 <div class="c scroll">
-<h3>Fixed Setup Results</h3>
-<table><thead><tr><th>Days</th><th>Trades</th><th>Wins</th><th>Losses</th><th>Win Rate</th><th>TP</th><th>SL</th><th>Net P/L</th><th>End</th><th>Max DD</th></tr></thead>
-<tbody id=tb></tbody></table>
+<h3>Results</h3>
+<table><thead><tr>
+<th>TP</th><th>Days</th><th>Trades</th><th>Win Rate</th><th>TP Hits</th><th>EOD Profit</th><th>RSI SL</th><th>Net P/L</th><th>End</th><th>Max DD</th><th>Open</th>
+</tr></thead><tbody id=tb></tbody></table>
 </div>
-</div><script>
+</div>
+<script>
 const f=(x,n=2)=>Number(x||0).toFixed(n);
 async function load(){
- let j=await(await fetch('/api/status',{cache:'no-store'})).json(),o=j.optimizer||{};
- msg.textContent=(o.running?'Running: ':'')+(o.progress||'')+(o.error?' | '+o.error:'');
- if(o.result&&o.result.periods){
-  tb.innerHTML='';
-  o.result.periods.forEach(x=>tb.innerHTML+=`<tr><td>${x.days}</td><td>${x.trades}</td><td>${x.wins}</td><td>${x.losses}</td><td>${f(x.win_rate,1)}%</td><td>${x.tp_hits}</td><td>${x.sl_hits}</td><td class="${x.net_pnl>=0?'g':'r'}">$${f(x.net_pnl)}</td><td>$${f(x.ending_balance)}</td><td>${f(x.max_drawdown_pct,1)}%</td></tr>`);
+ const j=await(await fetch('/api/status',{cache:'no-store'})).json();
+ msg.textContent=(j.running?'Running: ':'')+(j.progress||'')+(j.error?' | '+j.error:'');
+ if(j.result&&j.result.results){
+   tb.innerHTML='';
+   j.result.results.forEach(x=>{
+    tb.innerHTML+=`<tr>
+    <td>${f(x.tp_pct,0)}%</td><td>${x.days}</td><td>${x.trades}</td><td>${f(x.win_rate,1)}%</td>
+    <td>${x.tp_hits}</td><td>${x.profit_exits}</td><td>${x.rsi_sl_exits}</td>
+    <td class="${x.net_pnl>=0?'g':'r'}">$${f(x.net_pnl)}</td>
+    <td>$${f(x.end_balance)}</td><td>${f(x.max_dd,1)}%</td>
+    <td>${x.open_position||'-'}${x.open_position?' ('+(x.unrealized_pnl>=0?'+':'')+f(x.unrealized_pnl)+')':''}</td>
+    </tr>`;
+   });
  }
 }
 async function run(){
+ const d=Math.max(1,Math.min(180,parseInt(days.value||30)));
+ const tps=[...document.querySelectorAll('input[name=tp]:checked')].map(x=>Number(x.value));
+ if(!tps.length){alert('Kam az kam ek TP select karein');return;}
  msg.textContent='Starting...';
- await fetch('/api/optimize',{method:'POST'});
+ await fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({days:d,tps:tps})});
  setTimeout(load,1000);
 }
-load();setInterval(load,10000);
+load();setInterval(load,8000);
 </script></body></html>"""
 
 @app.get("/")
@@ -386,4 +472,4 @@ def home():
     return Response(HTML,mimetype="text/html")
 
 if __name__=="__main__":
-    app.run(host="0.0.0.0",port=int(os.environ.get("PORT","8080")),threaded=True)
+    app.run(host="0.0.0.0",port=8080)
