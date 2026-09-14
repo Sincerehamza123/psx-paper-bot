@@ -236,124 +236,80 @@ def evaluate_signal(sig, m15, tp_pct, sl_pct):
     costs=(NOTIONAL+qty*exit_px)*(FEE+SLIP)
     return gross-costs, reason
 
+
+# LOCKED setup for validation — no optimizer / no cherry-picking per period.
+LOCK_RSI=(50,65)
+LOCK_PULLBACK=0.0
+LOCK_VOL=0.8
+LOCK_RECOVERY="CLOSE_PREV_HIGH"
+LOCK_TP=1.5
+LOCK_SL=0.6
+TEST_PERIODS=[15,30,60,90]
+
 def run_optimizer(days=90):
     with lock:
-        state["optimizer"]={"running":True,"progress":"Starting...","result":None,"error":None,"last_run":None}
+        state["optimizer"]={"running":True,"progress":"Starting fixed validation...","result":None,"error":None,"last_run":None}
     try:
         cache={}
         for idx,inst in enumerate(COINS,1):
             with lock:
                 state["optimizer"]["progress"]=f"Downloading {idx}/{len(COINS)} {inst}"
             try:
-                h1=hist_bars(inst,"1H",days)
-                m15=hist_bars(inst,"15m",days)
+                h1=hist_bars(inst,"1H",95)
+                m15=hist_bars(inst,"15m",95)
                 if len(h1)>=60 and len(m15)>=80:
                     cache[inst]=(h1,m15)
             except Exception:
                 pass
 
-        # FAST focused grid: 120 variants instead of 1,440.
-        # Based on the strongest 15-day family so 60-day tests finish much faster.
-        rsi_ranges=[(45,60),(48,62),(50,65)]
-        pullbacks=[0.0]
-        vols=[0.8,1.0]
-        modes=["CLOSE_PREV_HIGH"]
-        tps=[0.6,0.8,1.0,1.2,1.5]
-        sls=[0.3,0.4,0.5,0.6]
+        with lock:
+            state["optimizer"]["progress"]="Building locked signals..."
 
-        signal_cache={}
-        base_total=len(rsi_ranges)*len(pullbacks)*len(vols)*len(modes)
-        bdone=0
-        for rr in rsi_ranges:
-            for pd in pullbacks:
-                for vm in vols:
-                    for mode in modes:
-                        bdone+=1
-                        with lock:
-                            state["optimizer"]["progress"]=f"Building signals {bdone}/{base_total}"
-                        all_s=[]
-                        for inst,(h1,m15) in cache.items():
-                            sigs=build_signals(h1,m15,rr[0],rr[1],pd,vm,mode)
-                            for s in sigs:
-                                s["coin"]=inst
-                            all_s.extend(sigs)
-                        signal_cache[(rr,pd,vm,mode)]=all_s
+        evaluated=[]
+        for inst,(h1,m15) in cache.items():
+            sigs=build_signals(h1,m15,LOCK_RSI[0],LOCK_RSI[1],LOCK_PULLBACK,LOCK_VOL,LOCK_RECOVERY)
+            for s in sigs:
+                s["coin"]=inst
+                net,reason=evaluate_signal(s,m15,LOCK_TP,LOCK_SL)
+                evaluated.append({
+                    "day":s["day"],"coin":inst,"net":net,"reason":reason,
+                    "score":s["score"],"rsi":s["rsi"],"volx":s["volx"]
+                })
 
-        combos=[]
-        total=base_total*len(tps)*len(sls)
-        done=0
+        results=[]
+        today=datetime.now(timezone.utc).date()
+        for period in TEST_PERIODS:
+            cutoff=(today-timedelta(days=period)).isoformat()
+            subset=[x for x in evaluated if x["day"]>=cutoff]
+            byday={}
+            for t in subset:
+                byday.setdefault(t["day"],[]).append(t)
+            chosen=[sorted(byday[d],key=lambda x:x["score"],reverse=True)[0] for d in sorted(byday)]
+            wins=sum(1 for x in chosen if x["net"]>0)
+            tph=sum(1 for x in chosen if x["reason"]=="TP")
+            slh=sum(1 for x in chosen if x["reason"]=="SL")
+            dd,endbal=max_drawdown(chosen)
+            n=len(chosen)
+            results.append({
+                "days":period,"trades":n,"wins":wins,"losses":n-wins,
+                "win_rate":(wins/n*100 if n else 0),
+                "tp_hits":tph,"sl_hits":slh,
+                "net_pnl":endbal-CAPITAL,"ending_balance":endbal,
+                "max_drawdown_pct":dd
+            })
 
-        for (rr,pd,vm,mode),signals in signal_cache.items():
-            for tp in tps:
-                for sl in sls:
-                    done+=1
-                    with lock:
-                        state["optimizer"]["progress"]=f"Testing {done}/{total}"
-
-                    evaluated=[]
-                    for s in signals:
-                        m15=cache[s["coin"]][1]
-                        net,reason=evaluate_signal(s,m15,tp,sl)
-                        evaluated.append({
-                            "day":s["day"],"coin":s["coin"],"net":net,"reason":reason,
-                            "score":s["score"],"rsi":s["rsi"],"volx":s["volx"]
-                        })
-
-                    # Max 1 trade/day, choose highest-quality candidate known at entry.
-                    byday={}
-                    for t in evaluated:
-                        byday.setdefault(t["day"],[]).append(t)
-                    chosen=[]
-                    for d in sorted(byday):
-                        chosen.append(sorted(byday[d],key=lambda x:x["score"],reverse=True)[0])
-
-                    wins=sum(1 for x in chosen if x["net"]>0)
-                    tph=sum(1 for x in chosen if x["reason"]=="TP")
-                    slh=sum(1 for x in chosen if x["reason"]=="SL")
-                    dd,endbal=max_drawdown(chosen)
-                    n=len(chosen)
-                    netp=endbal-CAPITAL
-                    wr=(wins/n*100) if n else 0
-
-                    # Penalize tiny samples and drawdown.
-                    sample=min(1.0,n/18.0) if n else 0
-                    score=(netp-0.30*dd)*sample
-
-                    combos.append({
-                        "rsi":f"{rr[0]}-{rr[1]}",
-                        "pullback_pct":pd,
-                        "vol_mult":vm,
-                        "recovery":mode,
-                        "tp_pct":tp,
-                        "sl_pct":sl,
-                        "trades":n,
-                        "wins":wins,
-                        "win_rate":wr,
-                        "tp_hits":tph,
-                        "sl_hits":slh,
-                        "net_pnl":netp,
-                        "ending_balance":endbal,
-                        "max_drawdown_pct":dd,
-                        "score":score
-                    })
-
-        combos.sort(key=lambda x:(x["score"],x["net_pnl"]),reverse=True)
-        profitable=[x for x in combos if x["net_pnl"]>0 and x["trades"]>=12]
         result={
-            "days":days,
-            "variants_tested":len(combos),
-            "best":combos[0] if combos else None,
-            "best_profitable":profitable[0] if profitable else None,
-            "top10":combos[:10],
-            "profitable_count":len(profitable),
-            "note":"Same-sample optimization can overfit. A positive result should later be checked on a different date range before live use."
+            "locked":{
+                "rsi":"50-65","pullback_pct":LOCK_PULLBACK,"vol_mult":LOCK_VOL,
+                "recovery":LOCK_RECOVERY,"tp_pct":LOCK_TP,"sl_pct":LOCK_SL
+            },
+            "periods":results,
+            "coins_loaded":len(cache),
+            "note":"Same exact setup tested on 15/30/60/90 days. No per-period optimization."
         }
         with lock:
             state["optimizer"].update({
-                "running":False,
-                "progress":"Complete",
-                "result":result,
-                "error":None,
+                "running":False,"progress":"Complete","result":result,"error":None,
                 "last_run":datetime.now(timezone.utc).isoformat()
             })
     except Exception as e:
@@ -362,16 +318,11 @@ def run_optimizer(days=90):
 
 @app.post("/api/optimize")
 def api_optimize():
-    try:
-        days=int((request.get_json(silent=True) or {}).get("days",90))
-    except:
-        days=90
-    days=max(1,min(days,90))
     with lock:
         if state["optimizer"]["running"]:
-            return jsonify({"ok":False,"message":"Optimizer already running"}),409
-        threading.Thread(target=run_optimizer,args=(days,),daemon=True).start()
-    return jsonify({"ok":True,"days":days})
+            return jsonify({"ok":False,"message":"Validation already running"}),409
+        threading.Thread(target=run_optimizer,args=(90,),daemon=True).start()
+    return jsonify({"ok":True})
 
 @app.get("/api/status")
 def api_status():
@@ -380,67 +331,54 @@ def api_status():
 
 HTML=r"""<!doctype html><html><head>
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Trend Pullback Recovery Backtest</title>
+<title>Locked Pullback Validation</title>
 <style>
-body{margin:0;background:#071019;color:#eef6ff;font-family:Arial;padding:14px}.w{max-width:1100px;margin:auto}
-.c{background:#111d29;border:1px solid #27394b;border-radius:14px;padding:14px;margin-bottom:12px}
-.grid{display:grid;grid-template-columns:repeat(5,1fr);gap:8px}.k{background:#09141e;padding:10px;border-radius:9px}
-.v{font-size:20px;font-weight:bold}.sub{color:#a8bacb;font-size:13px;line-height:1.5}.g{color:#6ff0a0}.r{color:#ff9999}.y{color:#ffd479}
-button{padding:11px 16px;border:0;border-radius:8px;background:#387df3;color:white;font-weight:bold}
-input{background:#09141e;color:white;border:1px solid #33485a;border-radius:8px;padding:10px;width:90px}
-table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:8px;border-bottom:1px solid #253645;text-align:right;white-space:nowrap}
+body{margin:0;background:#071019;color:#eef6ff;font-family:Arial;padding:14px}.w{max-width:1000px;margin:auto}
+.c{background:#111d29;border:1px solid #27394b;border-radius:14px;padding:16px;margin-bottom:12px}
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.k{background:#09141e;padding:11px;border-radius:9px}
+.v{font-size:20px;font-weight:bold}.sub{color:#a8bacb;line-height:1.5}.g{color:#6ff0a0}.r{color:#ff9999}
+button{padding:12px 17px;border:0;border-radius:8px;background:#387df3;color:white;font-weight:bold;font-size:16px}
+table{width:100%;border-collapse:collapse}th,td{padding:9px;border-bottom:1px solid #253645;text-align:right;white-space:nowrap}
 th:first-child,td:first-child{text-align:left}.scroll{overflow:auto}
 @media(max-width:700px){.grid{grid-template-columns:1fr 1fr}}
 </style></head><body><div class=w>
 <div class=c>
-<h2>Trend Pullback Recovery — FAST Backtest</h2>
-<div class=sub">Breakout chase nahi. 1H bullish trend ke andar 15m pullback ka wait, phir immediate green recovery par entry. $100 capital, 5x max notional $500, fees + slippage included, max 1 trade/day.</div>
+<h2>Locked Pullback Recovery — Validation</h2>
+<div class=sub">Ab optimizer har period ke liye rules change nahi karega. Same exact setup 15, 30, 60 aur 90 days par test hoga.</div>
 </div>
-
+<div class="c grid">
+<div class=k><div class=sub>RSI</div><div class=v>50–65</div></div>
+<div class=k><div class=sub>Pullback</div><div class=v>0%</div></div>
+<div class=k><div class=sub>Volume</div><div class=v>0.8x</div></div>
+<div class=k><div class=sub>Recovery</div><div class=v style="font-size:14px">CLOSE_PREV_HIGH</div></div>
+<div class=k><div class=sub>TP</div><div class=v>1.5%</div></div>
+<div class=k><div class=sub>SL</div><div class=v>0.6%</div></div>
+</div>
 <div class=c>
-<h3>Fast Auto Test</h3>
-<div class=sub">1 se 90 days tak jitne din chahein select karein. Fast mode: 120 focused variants test honge. 1,440 wale full test se bohat tez aur Render restart ka chance kam.</div><br>
-Days <input id=days type=number value=15 min=1 max=90 step=1>
-<button onclick=runopt()>Run Fast Backtest</button>
+<button onclick=run()>Run 15/30/60/90 Validation</button>
 <div id=msg class=sub style="margin-top:12px"></div>
 </div>
-
-<div class="c grid" id=sum></div>
-
 <div class="c scroll">
-<h3>Top 10 Setups</h3>
-<table><thead><tr>
-<th>#</th><th>RSI</th><th>Pullback</th><th>Vol</th><th>Recovery</th><th>TP</th><th>SL</th><th>Trades</th><th>Win Rate</th><th>Net P/L</th><th>End</th><th>Max DD</th>
-</tr></thead><tbody id=tb></tbody></table>
+<h3>Fixed Setup Results</h3>
+<table><thead><tr><th>Days</th><th>Trades</th><th>Wins</th><th>Losses</th><th>Win Rate</th><th>TP</th><th>SL</th><th>Net P/L</th><th>End</th><th>Max DD</th></tr></thead>
+<tbody id=tb></tbody></table>
 </div>
-</div>
-
-<script>
+</div><script>
 const f=(x,n=2)=>Number(x||0).toFixed(n);
-
 async function load(){
- let j=await(await fetch('/api/status',{cache:'no-store'})).json();
- let o=j.optimizer||{};
+ let j=await(await fetch('/api/status',{cache:'no-store'})).json(),o=j.optimizer||{};
  msg.textContent=(o.running?'Running: ':'')+(o.progress||'')+(o.error?' | '+o.error:'');
- if(o.result){
-   let r=o.result, b=r.best_profitable||r.best;
-   sum.innerHTML=b?
-    `<div class=k><div class=sub>Variants</div><div class=v>${r.variants_tested}</div></div>`+
-    `<div class=k><div class=sub>Profitable</div><div class=v>${r.profitable_count}</div></div>`+
-    `<div class=k><div class=sub>Best Net P/L</div><div class="v ${b.net_pnl>=0?'g':'r'}">$${f(b.net_pnl)}</div></div>`+
-    `<div class=k><div class=sub>End Balance</div><div class=v>$${f(b.ending_balance)}</div></div>`+
-    `<div class=k><div class=sub>Max DD</div><div class=v>${f(b.max_drawdown_pct,1)}%</div></div>`:'';
-   tb.innerHTML='';
-   (r.top10||[]).forEach((x,i)=>tb.innerHTML+=
-    `<tr><td>#${i+1}</td><td>${x.rsi}</td><td>${x.pullback_pct}%</td><td>${x.vol_mult}x</td><td>${x.recovery}</td><td>${x.tp_pct}%</td><td>${x.sl_pct}%</td><td>${x.trades}</td><td>${f(x.win_rate,1)}%</td><td class="${x.net_pnl>=0?'g':'r'}">${f(x.net_pnl)}</td><td>${f(x.ending_balance)}</td><td>${f(x.max_drawdown_pct,1)}%</td></tr>`);
+ if(o.result&&o.result.periods){
+  tb.innerHTML='';
+  o.result.periods.forEach(x=>tb.innerHTML+=`<tr><td>${x.days}</td><td>${x.trades}</td><td>${x.wins}</td><td>${x.losses}</td><td>${f(x.win_rate,1)}%</td><td>${x.tp_hits}</td><td>${x.sl_hits}</td><td class="${x.net_pnl>=0?'g':'r'}">$${f(x.net_pnl)}</td><td>$${f(x.ending_balance)}</td><td>${f(x.max_drawdown_pct,1)}%</td></tr>`);
  }
 }
-async function runopt(){
+async function run(){
  msg.textContent='Starting...';
- await fetch('/api/optimize',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({days:parseInt(days.value||90)})});
+ await fetch('/api/optimize',{method:'POST'});
  setTimeout(load,1000);
 }
-load();setInterval(load,15000);
+load();setInterval(load,10000);
 </script></body></html>"""
 
 @app.get("/")
