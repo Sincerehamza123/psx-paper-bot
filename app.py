@@ -176,25 +176,30 @@ def simulate(cache, period_days, tp_pct):
     # fully known at day close, entry is NEXT day's open (avoids look-ahead).
     candidates = {}
     for inst, rows in cache.items():
-        for i in range(len(rows)-1):
+        for i in range(1, len(rows)-1):
+            prev = rows[i-1]
             s = rows[i]
             if s["day"] < cutoff:
                 continue
+
+            # New rule: the day BEFORE the signal candle must also be green.
+            if not (prev["c"] > prev["o"]):
+                continue
+
+            # Signal candle keeps the original rules:
+            # green, no lower wick, RSI(14) >50 and <60.
             if not is_signal(s):
                 continue
+
             nxt = rows[i+1]
             body_pct = (s["c"]-s["o"])/s["o"]*100 if s["o"] else 0
-            # 40% pullback entry inside the signal candle BODY.
-            # Example: signal Open=10, Close=11 -> body=1 -> entry=10.60.
-            entry_level = s["c"] - 0.40*(s["c"] - s["o"])
-            if nxt["l"] <= entry_level:
-                candidates.setdefault(nxt["day"], []).append({
-                    "coin":inst,
-                    "signal":s,
-                    "entry_row":nxt,
-                    "entry_level":entry_level,
-                    "score":body_pct + (s["rsi"]-50.0)/10.0
-                })
+            candidates.setdefault(nxt["day"], []).append({
+                "coin":inst,
+                "prev":prev,
+                "signal":s,
+                "entry_row":nxt,
+                "score":body_pct + (s["rsi"]-50.0)/10.0
+            })
 
     equity = START_CAPITAL
     peak = START_CAPITAL
@@ -259,7 +264,7 @@ def simulate(cache, period_days, tp_pct):
             picks = candidates[day]
             pick = sorted(picks, key=lambda x:x["score"], reverse=True)[0]
             e = pick["entry_row"]
-            entry_raw = pick["entry_level"]
+            entry_raw = e["o"]
             entry_exec = entry_raw*(1+SLIP)
 
             # Max 5x current equity; this prevents impossible negative leverage.
@@ -397,8 +402,8 @@ def run_test(days, tp_levels):
                 "last_run":datetime.now(timezone.utc).isoformat(),
                 "result":{
                     "rules":{
-                        "signal":"Daily green candle; Low >= Open (no lower wick); RSI(14) >50 and <60",
-                        "entry":"Next day limit entry at 40% pullback into signal candle body; trade only if next-day LOW touches it",
+                        "signal":"Previous daily candle must be green; signal candle green with Low >= Open (no lower wick) and RSI(14) >50 and <60",
+                        "entry":"Next day OPEN after valid 2-green setup",
                         "max_trades":"Maximum 1 new trade per day; only 1 global open position at a time",
                         "tp":"Selected fixed TP: 5/10/15/20/25/30% from entry; hit checked from daily HIGH",
                         "exit_profit":"If TP is not hit, close at day-end only when Close > entry",
@@ -455,12 +460,13 @@ th:first-child,td:first-child{text-align:left}.scroll{overflow:auto}.g{color:#6f
 @media(max-width:650px){.grid{grid-template-columns:1fr}}
 </style></head><body><div class=w>
 <div class=c><h2>Daily Green No-Lower-Wick + RSI Strategy</h2>
-<div class=sub>OKX ke tamam LIVE USDT spot pairs scan honge. Valid signal ke baad entry signal candle body ke 40% pullback par hogi; next day price wahan aaye tabhi trade. Ek din mein maximum 1 new trade.</div></div>
+<div class=sub>OKX ke tamam LIVE USDT spot pairs scan honge. Signal candle se pehle wali daily candle bhi green honi chahiye. Signal candle green + Low ≥ Open + RSI 50–60 hogi. Entry next day Open par hogi. Ek din mein maximum 1 new trade.</div></div>
 
 <div class="c grid">
-<div class=k><div class=sub>Signal Candle</div><div class=v>Green + Low ≥ Open</div></div>
+<div class=k><div class=sub>Setup</div><div class=v>Previous Green + Signal Green</div></div>
+<div class=k><div class=sub>Signal Candle</div><div class=v>Low ≥ Open + RSI 50–60</div></div>
 <div class=k><div class=sub>RSI(14)</div><div class=v>&gt; 50 and &lt; 60</div></div>
-<div class=k><div class=sub>Entry</div><div class=v>40% pullback of signal body</div></div>
+<div class=k><div class=sub>Entry</div><div class=v>Next Day Open</div></div>
 <div class=k><div class=sub>Max Trades</div><div class=v>1 new trade / day</div></div>
 <div class=k><div class=sub>Day-end SL</div><div class=v>RSI &lt; 50</div></div>
 <div class=k><div class=sub>Capital</div><div class=v>$100 / max 5x</div></div>
