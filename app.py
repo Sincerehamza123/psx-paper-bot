@@ -101,7 +101,7 @@ def stop_price(entry_raw,entry_exec,qty,max_loss):
     den=(1-SLIP)*(1-FEE)
     return max(0.0,min(entry_raw,num/den if den>0 else 0.0))
 
-def simulate(cache,days,rsi_lo,rsi_hi,wick_tol_pct,max_loss,prev_green,hold_days,trend_mode,min_profit_pct=0.0):
+def simulate(cache,days,rsi_lo,rsi_hi,wick_tol_pct,max_loss,prev_green,hold_days,trend_mode,min_profit_pct=0.0,body_min_pct=0.0,vol_mult=0.0):
     cutoff=(datetime.now(timezone.utc).date()-timedelta(days=days)).isoformat()
     candidates={}
     for inst,rows in cache.items():
@@ -120,7 +120,14 @@ def simulate(cache,days,rsi_lo,rsi_hi,wick_tol_pct,max_loss,prev_green,hold_days
             elif trend_mode=="EMA20+EMA50":
                 if s.get("ema20") is None or s.get("ema50") is None or prev.get("ema20") is None: continue
                 if not (s["c"]>s["ema20"]>s["ema50"] and s["ema20"]>prev["ema20"]): continue
-            score=(s["c"]-s["o"])/s["o"]*100 + (s["rsi"]-rsi_lo)/max(1,(rsi_hi-rsi_lo))
+            body_pct=(s["c"]-s["o"])/s["o"]*100
+            if body_pct < body_min_pct: continue
+            if vol_mult > 0:
+                hist=[x["v"] for x in rows[max(0,i-20):i] if x.get("v") is not None]
+                if len(hist)<10: continue
+                avg_vol=sum(hist)/len(hist)
+                if avg_vol<=0 or s["v"] < avg_vol*vol_mult: continue
+            score=body_pct + (s["rsi"]-rsi_lo)/max(1,(rsi_hi-rsi_lo))
             candidates.setdefault(nxt["day"],[]).append({"coin":inst,"signal":s,"entry_row":nxt,"score":score})
 
     equity=START_CAPITAL; peak=START_CAPITAL; maxdd=0.0
@@ -194,40 +201,36 @@ def run_test(days):
             except Exception:
                 pass
 
-        # 365D PROFIT IMPROVEMENT TEST
-        # Signal is LOCKED from validated winner:
-        # EMA20+EMA50 | RSI 52-62 | Wick 0.10% | Previous Green = Yes.
-        # Only risk/exit management changes.
-        rsi_ranges=[(51,62),(52,62),(52,63)]
-        wick_tols=[0.05,0.10,0.15]
-        max_losses=[2.25,2.50,2.75]
-        prev_opts=[True]
-        hold_days_list=[3,4]
-        trend_modes=["EMA20+EMA50"]
-        min_profit_pcts=[0.20,0.40,0.60,0.80]
-        total=len(rsi_ranges)*len(wick_tols)*len(max_losses)*len(hold_days_list)*len(min_profit_pcts)
+        # HAMZA BEST STRATEGY remains locked; only entry quality is tested.
+        rsi_lo,rsi_hi=52,63
+        wick_tol=0.05
+        max_loss=2.75
+        prev_green=True
+        hold_days=3
+        trend_mode="EMA20+EMA50"
+        min_profit_pct=0.60
+
+        body_min_pcts=[0.00,0.15,0.30,0.45]
+        vol_mults=[0.00,0.80,1.00,1.20,1.50]
+        total=len(body_min_pcts)*len(vol_mults)
         results=[]; n=0
 
-        for rr in rsi_ranges:
-            for wt in wick_tols:
-                for ml in max_losses:
-                    for pg in prev_opts:
-                        for hd in hold_days_list:
-                            for tm in trend_modes:
-                                for mp in min_profit_pcts:
-                                    n+=1
-                                    with lock:
-                                        state["test"]["progress"]=f"Testing profit variant {n}/{total}"
-                                    r=simulate(cache,days,rr[0],rr[1],wt,ml,pg,hd,tm,mp)
-                                    r.update({
-                                        "rsi":f"{rr[0]}-{rr[1]}","wick_tol":wt,
-                                        "max_loss":ml,"prev_green":pg,"hold_days":hd,
-                                        "trend":tm,"min_profit_pct":mp
-                                    })
-                                    r["monthly_avg"] = r["net_pnl"]/12.0
-                                    r["target_gap"] = r["net_pnl"]-360.0
-                                    r["target_hit"] = r["net_pnl"] >= 360.0
-                                    results.append(r)
+        for body_min in body_min_pcts:
+            for vm in vol_mults:
+                n+=1
+                with lock:
+                    state["test"]["progress"]=f"Testing entry quality {n}/{total}"
+                r=simulate(cache,days,rsi_lo,rsi_hi,wick_tol,max_loss,prev_green,hold_days,trend_mode,min_profit_pct,body_min,vm)
+                r.update({
+                    "rsi":"52-63","wick_tol":wick_tol,"max_loss":max_loss,
+                    "prev_green":True,"hold_days":hold_days,"trend":trend_mode,
+                    "min_profit_pct":min_profit_pct,
+                    "body_min_pct":body_min,"vol_mult":vm
+                })
+                r["monthly_avg"]=r["net_pnl"]/12.0
+                r["target_gap"]=r["net_pnl"]-360.0
+                r["target_hit"]=r["net_pnl"]>=360.0
+                results.append(r)
 
         # Stability score: prefer profit with lower drawdown and enough trades.
         for x in results:
@@ -283,11 +286,11 @@ button{padding:12px 18px;border:0;border-radius:9px;background:#387df3;color:whi
 table{width:100%;border-collapse:collapse}th,td{padding:9px;border-bottom:1px solid #253645;text-align:right;white-space:nowrap}
 th:first-child,td:first-child{text-align:left}.scroll{overflow:auto}.g{color:#6ff0a0}.r{color:#ff9999}
 </style></head><body><div class=w>
-<div class=c><h2>365D — $30/Month Target Optimizer V3</h2>
-<div class=sub>Signal rules LOCKED hain: EMA20+EMA50, RSI 52–62, Wick 0.10%, Previous Green = Yes. Ab sirf profit/risk management test hoga: Profitable zone ko narrow fine-tune karega: RSI 51–63 ke selected ranges, Wick 0.05–0.15%, SL $2.25–$2.75, Hold 3–4 days aur EOD profit 0.20–0.80%. Target benchmark +$360/year hai. Drawdown 20% se upar jane par score mein strong penalty hogi. Sab OKX USDT pairs scan honge.</div></div>
+<div class=c><h2>HAMZA ENTRY QUALITY OPTIMIZER V1</h2>
+<div class=sub>Signal rules LOCKED hain: EMA20+EMA50, RSI 52–62, Wick 0.10%, Previous Green = Yes. Ab sirf profit/risk management test hoga: HAMZA Best Strategy LOCKED rahegi. Sirf entry quality test hogi: signal candle minimum body 0/0.15/0.30/0.45% aur signal volume prior 20-day average ka 0/0.8/1.0/1.2/1.5x. Total 20 variants. Sab OKX USDT pairs scan honge.</div></div>
 <div class=c><b>Backtest Days</b><br><br><input id=days type=number value=365 min=10 max=365>
-<button onclick=run()>Run 365D Optimizer V3</button> <button id=dl onclick="location.href='/api/download'" style="background:#18a66a">Download V3 Full Result CSV</button><div id=msg class=sub style="margin-top:12px"></div><div id=info class=sub></div></div>
-<div class="c scroll"><h3>Best Variants vs $360/Year Target</h3><table><thead><tr>
+<button onclick=run()>Run Entry Quality Test</button> <button id=dl onclick="location.href='/api/download'" style="background:#18a66a">Download Entry Quality Results</button><div id=msg class=sub style="margin-top:12px"></div><div id=info class=sub></div></div>
+<div class="c scroll"><h3>Entry Quality Results</h3><table><thead><tr>
 <th>#</th><th>Trend Filter</th><th>RSI</th><th>Wick Tol</th><th>SL</th><th>Prev Green</th><th>Max Hold</th><th>Min EOD Profit</th><th>Trades</th><th>WR</th><th>EOD Profit</th><th>SL Hits</th><th>Net P/L</th><th>End</th><th>Max DD</th><th>Score</th>
 </tr></thead><tbody id=tb></tbody></table></div>
 </div><script>
