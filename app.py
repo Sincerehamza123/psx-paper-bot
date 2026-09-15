@@ -1,362 +1,93 @@
+import os,json,subprocess,threading,csv
+from http.server import ThreadingHTTPServer,BaseHTTPRequestHandler
+from urllib.request import urlopen,Request
+from pathlib import Path
+from datetime import datetime,timedelta,timezone
 
-import json, threading, time, urllib.parse, urllib.request, csv, io
-from datetime import datetime, timezone, timedelta
-from flask import Flask, jsonify, Response, request
+BASE=Path("/app"); UD=BASE/"user_data"; STRAT=UD/"strategies"/"GeneticEngineV1.py"; CONFIG=UD/"config.json"; RESULT=UD/"backtest_results"
+STATE={"running":False,"status":"Ready","progress":0,"error":"","summary":None,"report":None}; LOCK=threading.Lock()
 
-app = Flask(__name__)
-BASE = "https://www.okx.com"
+HTML="""<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>GeneticEngineV1 365D</title>
+<style>body{font-family:Arial;background:#0b1220;color:#e8eef9;padding:18px}.card{max-width:800px;margin:auto;background:#121c2e;padding:20px;border-radius:16px}button{background:#2878ed;color:white;border:0;padding:14px 18px;border-radius:10px;font-weight:bold}.bar{height:12px;background:#26344b;border-radius:8px;overflow:hidden}.fill{height:100%;background:#2878ed}.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.box{background:#0c1525;padding:12px;border-radius:10px}.muted{color:#9db0cb}a{color:#7fb1ff}pre{white-space:pre-wrap}</style></head>
+<body><div class="card"><h1>GeneticEngineV1 - 365D Backtest</h1><p class="muted">Original GitHub strategy | 5m | OKX Spot | $100 start | Max 5 open trades | Top 20 USDT pairs</p>
+<button id="run" onclick="go()">Run 365 Days</button><p id="st">Ready</p><div class="bar"><div id="fill" class="fill" style="width:0%"></div></div><div id="sum"></div>
+<p><a id="dl" href="/download" style="display:none">Download Trade-wise CSV</a></p><pre id="err"></pre></div>
+<script>async function go(){run.disabled=true;await fetch('/run',{method:'POST'});poll()}async function poll(){let x=await(await fetch('/status')).json();st.textContent=x.status;fill.style.width=x.progress+'%';if(x.summary){let s=x.summary;sum.innerHTML='<div class="grid"><div class="box"><b>Trades</b><br>'+s.trades+'</div><div class="box"><b>Net P/L</b><br>$'+s.profit_abs+'</div><div class="box"><b>End Balance</b><br>$'+s.end_balance+'</div><div class="box"><b>Win Rate</b><br>'+s.win_rate+'%</div><div class="box"><b>Max DD</b><br>'+s.max_dd+'%</div><div class="box"><b>Pairs</b><br>'+s.pairs+'</div></div>';dl.style.display='inline'}if(x.error)err.textContent=x.error;if(x.running)setTimeout(poll,2500);else run.disabled=false}poll()</script></body></html>"""
 
-START_CAPITAL = 100.0
-LEVERAGE = 5.0
-FEE = 0.0005
-SLIP = 0.0001
-RSI_LEN = 14
+def cmd(a,timeout=7200):
+    p=subprocess.run(a,cwd=BASE,text=True,capture_output=True,timeout=timeout)
+    if p.returncode: raise RuntimeError((p.stdout+"\n"+p.stderr)[-6000:])
+    return p.stdout+p.stderr
 
-state={"test":{"running":False,"progress":"","result":None,"error":None,"last_run":None}}
-lock=threading.RLock()
+def pairs():
+    q=Request("https://www.okx.com/api/v5/market/tickers?instType=SPOT",headers={"User-Agent":"Mozilla/5.0"})
+    d=json.loads(urlopen(q,timeout=30).read())["data"]; a=[]
+    for x in d:
+        s=x.get("instId","")
+        if not s.endswith("-USDT"): continue
+        b=s[:-5]
+        if b in {"USDT","USDC","DAI","FDUSD","TUSD","USD","EUR"}: continue
+        try:v=float(x.get("volCcy24h") or 0)
+        except:v=0
+        a.append((v,b+"/USDT"))
+    return [p for _,p in sorted(a,reverse=True)[:20]]
 
-def api_get(path, params=None, timeout=25):
-    url=BASE+path
-    if params:
-        url += "?" + urllib.parse.urlencode(params)
-    req=urllib.request.Request(url,headers={"User-Agent":"Mozilla/5.0 VariantTester/1.0","Accept":"application/json"})
-    with urllib.request.urlopen(req,timeout=timeout) as r:
-        obj=json.loads(r.read().decode("utf-8"))
-    if obj.get("code")!="0":
-        raise RuntimeError(obj.get("msg") or "OKX error")
-    return obj.get("data",[])
+def config(ps):
+    c={"max_open_trades":5,"stake_currency":"USDT","stake_amount":"unlimited","tradable_balance_ratio":0.99,"dry_run_wallet":100,
+       "fiat_display_currency":"USD","dry_run":True,"trading_mode":"spot","exchange":{"name":"okx","key":"","secret":"","password":"",
+       "ccxt_config":{"enableRateLimit":True},"ccxt_async_config":{"enableRateLimit":True},"pair_whitelist":ps,"pair_blacklist":[]},
+       "pairlists":[{"method":"StaticPairList"}],"entry_pricing":{"price_side":"same","use_order_book":False,"order_book_top":1,"price_last_balance":0.0,
+       "check_depth_of_market":{"enabled":False,"bids_to_ask_delta":1}},"exit_pricing":{"price_side":"same","use_order_book":False,"order_book_top":1},
+       "database_url":"sqlite:///tradesv3.sqlite","initial_state":"running"}
+    CONFIG.write_text(json.dumps(c,indent=2))
 
-def get_all_usdt_spot_pairs():
-    raw=api_get("/api/v5/public/instruments",{"instType":"SPOT"})
-    exclude={"USDC","USDT","DAI","FDUSD","TUSD","USDP","EUR","EURT","GBP","AUD","TRY","BRL","AED","SGD","USD","PYUSD","USDE","USD0"}
-    out=[]
-    for x in raw:
-        if x.get("quoteCcy","").upper()=="USDT" and x.get("state")=="live" and x.get("baseCcy","").upper() not in exclude:
-            out.append(x.get("instId"))
-    return sorted(set(out))
+def parse(path,ps):
+    j=json.loads(path.read_text()); s=(j.get("strategy") or {}).get("GeneticEngineV1") or {}; ts=s.get("trades",[])
+    profit=float(s.get("profit_total_abs",0) or 0); wins=sum(float(t.get("profit_abs",0) or 0)>0 for t in ts)
+    dd=float(s.get("max_drawdown_account",0) or 0)*100
+    rp=UD/"genetic_engine_v1_365d_trades.csv"
+    with rp.open("w",newline="") as f:
+        w=csv.writer(f); w.writerow(["#","Pair","Open Date","Close Date","Open Rate","Close Rate","Profit $","Profit %","Exit Reason"])
+        for i,t in enumerate(ts,1): w.writerow([i,t.get("pair"),t.get("open_date"),t.get("close_date"),t.get("open_rate"),t.get("close_rate"),round(float(t.get("profit_abs",0) or 0),6),round(float(t.get("profit_ratio",0) or 0)*100,4),t.get("exit_reason")])
+    return {"trades":len(ts),"profit_abs":round(profit,2),"end_balance":round(100+profit,2),"win_rate":round(100*wins/len(ts),2) if ts else 0,"max_dd":round(dd,2),"pairs":len(ps)},str(rp)
 
-def parse_bar(r):
-    return {"ts":int(r[0]),"o":float(r[1]),"h":float(r[2]),"l":float(r[3]),"c":float(r[4]),"v":float(r[5]),"ok":str(r[8]) if len(r)>8 else "1"}
-
-def fetch_daily(inst,days=120):
-    target=int((datetime.now(timezone.utc)-timedelta(days=days+35)).timestamp()*1000)
-    rows={}
-    after=None
-    for _ in range(12):
-        p={"instId":inst,"bar":"1Dutc","limit":"100"}
-        if after is not None: p["after"]=str(after)
-        raw=api_get("/api/v5/market/history-candles",p)
-        if not raw: break
-        batch=[parse_bar(x) for x in raw if len(x)>=8]
-        if not batch: break
-        for b in batch:
-            if b["ok"]=="1": rows[b["ts"]]=b
-        oldest=min(x["ts"] for x in batch)
-        if oldest<=target: break
-        after=oldest
-        time.sleep(0.02)
-    return [x for x in sorted(rows.values(),key=lambda x:x["ts"]) if x["ts"]>=target]
-
-def rsi_series(closes,n=14):
-    out=[None]*len(closes)
-    if len(closes)<n+1:return out
-    ag=al=0.0
-    for i in range(1,n+1):
-        d=closes[i]-closes[i-1]
-        ag+=max(d,0); al+=max(-d,0)
-    ag/=n; al/=n
-    out[n]=100.0 if al==0 else 100-100/(1+ag/al)
-    for i in range(n+1,len(closes)):
-        d=closes[i]-closes[i-1]
-        ag=(ag*(n-1)+max(d,0))/n
-        al=(al*(n-1)+max(-d,0))/n
-        out[i]=100.0 if al==0 else 100-100/(1+ag/al)
-    return out
-
-def ema_series(values,n):
-    out=[None]*len(values)
-    if len(values)<n:return out
-    seed=sum(values[:n])/n
-    out[n-1]=seed
-    k=2/(n+1)
-    e=seed
-    for i in range(n,len(values)):
-        e=values[i]*k+e*(1-k)
-        out[i]=e
-    return out
-
-def prep(inst,bars):
-    closes=[x["c"] for x in bars]
-    rs=rsi_series(closes,RSI_LEN)
-    e20=ema_series(closes,20); e50=ema_series(closes,50)
-    out=[]
-    for i,b in enumerate(bars):
-        out.append({**b,"coin":inst,"day":datetime.fromtimestamp(b["ts"]/1000,tz=timezone.utc).date().isoformat(),"rsi":rs[i],"ema20":e20[i],"ema50":e50[i]})
-    return out
-
-def stop_price(entry_raw,entry_exec,qty,max_loss):
-    if qty<=0:return 0.0
-    per_unit=max_loss/qty
-    num=entry_exec*(1+FEE)-per_unit
-    den=(1-SLIP)*(1-FEE)
-    return max(0.0,min(entry_raw,num/den if den>0 else 0.0))
-
-def simulate(cache,days,rsi_lo,rsi_hi,wick_tol_pct,max_loss,prev_green,hold_days,trend_mode,min_profit_pct=0.0):
-    cutoff=(datetime.now(timezone.utc).date()-timedelta(days=days)).isoformat()
-    candidates={}
-    for inst,rows in cache.items():
-        for i in range(1,len(rows)-1):
-            prev=rows[i-1]; s=rows[i]; nxt=rows[i+1]
-            if s["day"]<cutoff or s["rsi"] is None: continue
-            if prev_green and not (prev["c"]>prev["o"]): continue
-            if not (s["c"]>s["o"]): continue
-            # wick tolerance: low can be at most X% below open
-            if s["l"] < s["o"]*(1-wick_tol_pct/100.0): continue
-            if not (rsi_lo < s["rsi"] < rsi_hi): continue
-            # Trend filter uses SIGNAL day only (no future data).
-            if trend_mode=="EMA20":
-                if s.get("ema20") is None or prev.get("ema20") is None: continue
-                if not (s["c"]>s["ema20"] and s["ema20"]>prev["ema20"]): continue
-            elif trend_mode=="EMA20+EMA50":
-                if s.get("ema20") is None or s.get("ema50") is None or prev.get("ema20") is None: continue
-                if not (s["c"]>s["ema20"]>s["ema50"] and s["ema20"]>prev["ema20"]): continue
-            score=(s["c"]-s["o"])/s["o"]*100 + (s["rsi"]-rsi_lo)/max(1,(rsi_hi-rsi_lo))
-            candidates.setdefault(nxt["day"],[]).append({"coin":inst,"signal":s,"entry_row":nxt,"score":score})
-
-    equity=START_CAPITAL; peak=START_CAPITAL; maxdd=0.0
-    trades=[]; open_pos=None
-    all_days=sorted({r["day"] for rows in cache.values() for r in rows if r["day"]>=cutoff})
-    rowmap={inst:{r["day"]:r for r in rows} for inst,rows in cache.items()}
-
-    for day in all_days:
-        if open_pos is not None:
-            row=rowmap[open_pos["coin"]].get(day)
-            if row is not None:
-                held=(datetime.fromisoformat(day).date()-datetime.fromisoformat(open_pos["entry_day"]).date()).days
-                reason=None; exit_exec=None
-                if row["l"]<=open_pos["stop_raw"]:
-                    reason=f"${max_loss:g} SL"; exit_exec=open_pos["stop_raw"]*(1-SLIP)
-                elif row["c"] >= open_pos["entry_raw"]*(1+min_profit_pct/100.0):
-                    reason=f"EOD PROFIT {min_profit_pct:g}%+"; exit_exec=row["c"]*(1-SLIP)
-                elif held>=hold_days:
-                    reason=f"MAX {hold_days}D EXIT"; exit_exec=row["c"]*(1-SLIP)
-                if reason:
-                    q=open_pos["qty"]
-                    net=q*(exit_exec-open_pos["entry_exec"])-FEE*q*open_pos["entry_exec"]-FEE*q*exit_exec
-                    equity+=net
-                    trades.append({"coin":open_pos["coin"],"signal_day":open_pos["signal_day"],"entry_day":open_pos["entry_day"],"entry_price":open_pos["entry_raw"],"exit_day":day,"exit_price":exit_exec,"reason":reason,"net":net,"balance":equity})
-                    open_pos=None
-                    peak=max(peak,equity)
-                    if peak>0:maxdd=max(maxdd,(peak-equity)/peak*100)
-
-        if open_pos is None and equity>0 and day in candidates:
-            pick=sorted(candidates[day],key=lambda x:x["score"],reverse=True)[0]
-            e=pick["entry_row"]; entry_raw=e["o"]; entry_exec=entry_raw*(1+SLIP)
-            notional=min(START_CAPITAL*LEVERAGE,equity*LEVERAGE)
-            qty=notional/entry_exec
-            sp=stop_price(entry_raw,entry_exec,qty,max_loss)
-            open_pos={"coin":pick["coin"],"signal_day":pick["signal"]["day"],"entry_day":day,"entry_raw":entry_raw,"entry_exec":entry_exec,"qty":qty,"stop_raw":sp}
-
-            # same-day exit
-            row=e; reason=None; exit_exec=None
-            if row["l"]<=sp:
-                reason=f"${max_loss:g} SL"; exit_exec=sp*(1-SLIP)
-            elif row["c"] >= entry_raw*(1+min_profit_pct/100.0):
-                reason=f"EOD PROFIT {min_profit_pct:g}%+"; exit_exec=row["c"]*(1-SLIP)
-            if reason:
-                net=qty*(exit_exec-entry_exec)-FEE*qty*entry_exec-FEE*qty*exit_exec
-                equity+=net
-                trades.append({"coin":open_pos["coin"],"signal_day":open_pos["signal_day"],"entry_day":day,"entry_price":open_pos["entry_raw"],"exit_day":day,"exit_price":exit_exec,"reason":reason,"net":net,"balance":equity})
-                open_pos=None
-                peak=max(peak,equity)
-                if peak>0:maxdd=max(maxdd,(peak-equity)/peak*100)
-
-    wins=sum(1 for t in trades if t["net"]>0)
-
-    # Month-wise breakup based on each trade's EXIT month.
-    monthly=[]
-    by_month={}
-    for tr in trades:
-        by_month.setdefault(tr["exit_day"][:7],[]).append(tr)
-    running=START_CAPITAL
-    for month in sorted(by_month):
-        mts=by_month[month]
-        pnl=sum(x["net"] for x in mts)
-        start_bal=running
-        running+=pnl
-        monthly.append({
-            "month":month,"trades":len(mts),
-            "wins":sum(1 for x in mts if x["net"]>0),
-            "losses":sum(1 for x in mts if x["net"]<=0),
-            "net_pnl":pnl,"start_balance":start_bal,"end_balance":running
-        })
-
-    return {
-        "trades":len(trades),"wins":wins,"win_rate":wins/len(trades)*100 if trades else 0,
-        "net_pnl":equity-START_CAPITAL,"end_balance":equity,"max_dd":maxdd,
-        "sl_hits":sum(1 for t in trades if "SL" in t["reason"]),
-        "profit_exits":sum(1 for t in trades if str(t["reason"]).startswith("EOD PROFIT")),
-        "trade_details":trades,"monthly":monthly
-    }
-
-def run_test(days):
-    with lock:
-        state["test"]={"running":True,"progress":"Starting...","result":None,"error":None,"last_run":None}
+def work():
     try:
-        days=max(10,min(int(days),365))
-        coins=get_all_usdt_spot_pairs()
-        cache={}
-        for idx,inst in enumerate(coins,1):
-            with lock: state["test"]["progress"]=f"Loading pairs {idx}/{len(coins)} — {inst}"
-            try:
-                b=fetch_daily(inst,days+20)
-                if len(b)>=20: cache[inst]=prep(inst,b)
-            except Exception:
-                pass
-
-        # 365D PROFIT IMPROVEMENT TEST
-        # Signal is LOCKED from validated winner:
-        # EMA20+EMA50 | RSI 52-62 | Wick 0.10% | Previous Green = Yes.
-        # Only risk/exit management changes.
-        rsi_ranges=[(52,63)]
-        wick_tols=[0.05]
-        max_losses=[2.75]
-        prev_opts=[True]
-        hold_days_list=[3]
-        trend_modes=["EMA20+EMA50"]
-        min_profit_pcts=[0.60]
-        total=1
-        results=[]; n=0
-
-        for rr in rsi_ranges:
-            for wt in wick_tols:
-                for ml in max_losses:
-                    for pg in prev_opts:
-                        for hd in hold_days_list:
-                            for tm in trend_modes:
-                                for mp in min_profit_pcts:
-                                    n+=1
-                                    with lock:
-                                        state["test"]["progress"]=f"Testing profit variant {n}/{total}"
-                                    r=simulate(cache,days,rr[0],rr[1],wt,ml,pg,hd,tm,mp)
-                                    r.update({
-                                        "rsi":f"{rr[0]}-{rr[1]}","wick_tol":wt,
-                                        "max_loss":ml,"prev_green":pg,"hold_days":hd,
-                                        "trend":tm,"min_profit_pct":mp
-                                    })
-                                    r["monthly_avg"] = r["net_pnl"]/12.0
-                                    r["target_gap"] = r["net_pnl"]-360.0
-                                    r["target_hit"] = r["net_pnl"] >= 360.0
-                                    results.append(r)
-
-        # Stability score: prefer profit with lower drawdown and enough trades.
-        for x in results:
-            x["score"] = x["net_pnl"] - 1.5*x["max_dd"] - max(0,x["max_dd"]-20)*5.0 + min(x["trades"],50)*0.15
-        results.sort(key=lambda x:(x["trades"]>=3,x["score"],x["net_pnl"],-x["max_dd"]),reverse=True)
-
-        with lock:
-            state["test"].update({
-                "running":False,"progress":"Complete","error":None,
-                "last_run":datetime.now(timezone.utc).isoformat(),
-                "result":{
-                    "days":days,"pairs_found":len(coins),"pairs_loaded":len(cache),
-                    "variants":total,"profitable":sum(1 for x in results if x["net_pnl"]>0),
-                    "top":results[:50]
-                }
-            })
+        with LOCK: STATE.update(running=True,status="Finding top 20 OKX pairs...",progress=5,error="",summary=None,report=None)
+        ps=pairs(); config(ps); end=datetime.now(timezone.utc).date(); start=end-timedelta(days=365); tr=f"{start:%Y%m%d}-{end:%Y%m%d}"
+        with LOCK: STATE.update(status="Downloading 5m candles...",progress=15)
+        cmd(["freqtrade","download-data","--config",str(CONFIG),"--timeframes","5m","--timerange",tr])
+        with LOCK: STATE.update(status="Running GeneticEngineV1...",progress=55)
+        RESULT.mkdir(parents=True,exist_ok=True); out=RESULT/"genetic.json"
+        cmd(["freqtrade","backtesting","--config",str(CONFIG),"--strategy-path",str(STRAT.parent),"--strategy","GeneticEngineV1","--timeframe","5m","--timerange",tr,"--export","trades","--export-filename",str(out)])
+        candidates=sorted(RESULT.glob("*.json"),key=lambda p:p.stat().st_mtime,reverse=True)
+        if not candidates: raise RuntimeError("Backtest result JSON not found.")
+        sm,rp=parse(candidates[0],ps)
+        with LOCK: STATE.update(running=False,status="Completed",progress=100,summary=sm,report=rp)
     except Exception as e:
-        with lock: state["test"].update({"running":False,"progress":"Failed","error":repr(e)})
+        with LOCK: STATE.update(running=False,status="Failed",progress=100,error=str(e))
 
-@app.post("/api/run")
-def run_api():
-    d=request.get_json(silent=True) or {}
-    days=int(d.get("days",60))
-    with lock:
-        if state["test"]["running"]: return jsonify({"ok":False}),409
-        threading.Thread(target=run_test,args=(days,),daemon=True).start()
-    return jsonify({"ok":True})
+class H(BaseHTTPRequestHandler):
+    def sendx(self,b,typ="text/html",code=200,headers=None):
+        self.send_response(code); self.send_header("Content-Type",typ); self.send_header("Content-Length",str(len(b)))
+        for k,v in (headers or {}).items(): self.send_header(k,v)
+        self.end_headers(); self.wfile.write(b)
+    def do_GET(self):
+        if self.path=="/": return self.sendx(HTML.encode())
+        if self.path=="/status":
+            with LOCK:x={k:v for k,v in STATE.items() if k!="report"}
+            return self.sendx(json.dumps(x).encode(),"application/json")
+        if self.path=="/download":
+            with LOCK:r=STATE.get("report")
+            if r and Path(r).exists(): return self.sendx(Path(r).read_bytes(),"text/csv",200,{"Content-Disposition":'attachment; filename="genetic_engine_v1_365d_trades.csv"'})
+            return self.sendx(b"No report yet","text/plain",404)
+        self.sendx(b"Not found","text/plain",404)
+    def do_POST(self):
+        if self.path=="/run":
+            with LOCK:
+                if not STATE["running"]: STATE["running"]=True; threading.Thread(target=work,daemon=True).start()
+            return self.sendx(b'{"ok":true}',"application/json")
+        self.sendx(b"Not found","text/plain",404)
+    def log_message(self,*a): pass
 
-@app.get("/api/download")
-def download_results():
-    with lock:
-        result=state["test"].get("result")
-    if not result:
-        return Response("Pehle backtest complete karein.",status=400,mimetype="text/plain")
-    rows=result.get("top",[])
-    if not rows:
-        return Response("Result nahi mila.",status=400,mimetype="text/plain")
-    x=rows[0]
-    out=io.StringIO()
-    w=csv.writer(out)
-
-    w.writerow(["HAMZA BEST STRATEGY - DETAILED REPORT"])
-    w.writerow(["EMA20+EMA50 | RSI 52-63 | Wick 0.05% | SL $2.75 | Previous Green Yes | Hold 3 Days | Min EOD Profit 0.60%"])
-    w.writerow([])
-    w.writerow(["OVERALL SUMMARY"])
-    w.writerow(["Trades","Profit Trades","Loss Trades","Win Rate %","EOD Profit","SL Hits","Net P/L $","End Balance $","Max DD %"])
-    w.writerow([x.get("trades"),x.get("wins"),x.get("trades",0)-x.get("wins",0),round(x.get("win_rate",0),2),
-                x.get("profit_exits"),x.get("sl_hits"),round(x.get("net_pnl",0),4),
-                round(x.get("end_balance",0),4),round(x.get("max_dd",0),2)])
-
-    w.writerow([])
-    w.writerow(["MONTH-WISE BREAKUP"])
-    w.writerow(["Month","Trades","Profit Trades","Loss Trades","Net P/L $","Starting Balance $","Ending Balance $"])
-    for m in x.get("monthly",[]):
-        w.writerow([m["month"],m["trades"],m["wins"],m["losses"],round(m["net_pnl"],4),
-                    round(m["start_balance"],4),round(m["end_balance"],4)])
-
-    w.writerow([])
-    w.writerow(["TRADE-WISE DETAIL"])
-    w.writerow(["Trade #","Coin","Signal Date","Entry Date","Entry Price","Exit Date","Exit Price","Exit Reason","P/L $","Running Balance $"])
-    for i,tr in enumerate(x.get("trade_details",[]),1):
-        w.writerow([i,tr.get("coin"),tr.get("signal_day"),tr.get("entry_day"),
-                    round(tr.get("entry_price",0),8),tr.get("exit_day"),round(tr.get("exit_price",0),8),
-                    tr.get("reason"),round(tr.get("net",0),4),round(tr.get("balance",0),4)])
-
-    name=f"hamza_best_{result.get('days',365)}days_month_trade_report.csv"
-    return Response(out.getvalue(),mimetype="text/csv",
-                    headers={"Content-Disposition":f"attachment; filename={name}"})
-
-@app.get("/api/status")
-def status():
-    with lock:return jsonify(state["test"])
-
-HTML=r"""<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>365D Profit Improvement Test</title><style>
-body{margin:0;background:#071019;color:#eef6ff;font-family:Arial;padding:14px}.w{max-width:1100px;margin:auto}
-.c{background:#111d29;border:1px solid #27394b;border-radius:14px;padding:16px;margin-bottom:12px}.sub{color:#a8bacb;line-height:1.5}
-input{width:120px;padding:11px;border-radius:8px;border:1px solid #3b4d60;background:#09141e;color:white;font-size:17px}
-button{padding:12px 18px;border:0;border-radius:9px;background:#387df3;color:white;font-weight:bold;font-size:16px}
-table{width:100%;border-collapse:collapse}th,td{padding:9px;border-bottom:1px solid #253645;text-align:right;white-space:nowrap}
-th:first-child,td:first-child{text-align:left}.scroll{overflow:auto}.g{color:#6ff0a0}.r{color:#ff9999}
-</style></head><body><div class=w>
-<div class=c><h2>HAMZA BEST — MONTH & TRADE REPORT</h2>
-<div class=sub>Signal rules LOCKED hain: EMA20+EMA50, RSI 52–62, Wick 0.10%, Previous Green = Yes. Ab sirf profit/risk management test hoga: HAMZA Best Strategy LOCKED hai. Strategy rules bilkul change nahi honge. Download CSV mein Overall Summary + Month-wise Breakup + har individual Trade ki Signal Date, Entry/Exit Price, P/L aur Running Balance milega. Sab OKX USDT pairs scan honge.</div></div>
-<div class=c><b>Backtest Days</b><br><br><input id=days type=number value=365 min=10 max=365>
-<button onclick=run()>Run 365D Detailed Report</button> <button id=dl onclick="location.href='/api/download'" style="background:#18a66a">Download Month + Trade CSV</button><div id=msg class=sub style="margin-top:12px"></div><div id=info class=sub></div></div>
-<div class="c scroll"><h3>HAMZA Best Detailed Result</h3><table><thead><tr>
-<th>#</th><th>Trend Filter</th><th>RSI</th><th>Wick Tol</th><th>SL</th><th>Prev Green</th><th>Max Hold</th><th>Min EOD Profit</th><th>Trades</th><th>WR</th><th>EOD Profit</th><th>SL Hits</th><th>Net P/L</th><th>End</th><th>Max DD</th><th>Score</th>
-</tr></thead><tbody id=tb></tbody></table></div>
-</div><script>
-const f=(x,n=2)=>Number(x||0).toFixed(n);
-async function load(){
- let j=await(await fetch('/api/status',{cache:'no-store'})).json();
- msg.textContent=(j.running?'Running: ':'')+(j.progress||'')+(j.error?' | '+j.error:'');
- if(j.result){
-   info.textContent=`Pairs: ${j.result.pairs_loaded}/${j.result.pairs_found} | Variants: ${j.result.variants} | Profitable: ${j.result.profitable}`;
-   tb.innerHTML='';
-   (j.result.top||[]).forEach((x,i)=>tb.innerHTML+=`<tr>
-   <td>${i+1}</td><td>${x.trend}</td><td>${x.rsi}</td><td>${f(x.wick_tol,2)}%</td><td>$${f(x.max_loss,0)}</td><td>${x.prev_green?'Yes':'No'}</td><td>${x.hold_days}d</td><td>${f(x.min_profit_pct,2)}%</td>
-   <td>${x.trades}</td><td>${f(x.win_rate,1)}%</td><td>${x.profit_exits}</td><td>${x.sl_hits}</td>
-   <td class="${x.net_pnl>=0?'g':'r'}">$${f(x.net_pnl)}</td><td>$${f(x.end_balance)}</td><td>${f(x.max_dd,1)}%</td><td>${f(x.score,1)}</td></tr>`);
- }
-}
-async function run(){msg.textContent='Starting...';await fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({days:parseInt(days.value||365)})});setTimeout(load,1000)}
-load();setInterval(load,8000);
-</script></body></html>"""
-
-@app.get("/")
-def home(): return Response(HTML,mimetype="text/html")
-
-if __name__=="__main__":
-    app.run(host="0.0.0.0",port=8080)
+if __name__=="__main__": ThreadingHTTPServer(("0.0.0.0",int(os.environ.get("PORT","8080"))),H).serve_forever()
