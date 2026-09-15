@@ -5,4 +5,4 @@ RUN mkdir -p /app/user_data/strategies /app/user_data/backtest_results && python
 COPY app.py /app/app.py
 RUN chown -R ftuser:ftuser /app
 USER ftuser
-CMD ["python","/app/app.py"]
+ENTRYPOINT ["python", "/app/app.py"]
