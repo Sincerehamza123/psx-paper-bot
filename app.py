@@ -101,7 +101,7 @@ def stop_price(entry_raw,entry_exec,qty,max_loss):
     den=(1-SLIP)*(1-FEE)
     return max(0.0,min(entry_raw,num/den if den>0 else 0.0))
 
-def simulate(cache,days,rsi_lo,rsi_hi,wick_tol_pct,max_loss,prev_green,hold_days,trend_mode,min_profit_pct=0.0,strategy_mode='HAMZA'):
+def simulate(cache,days,rsi_lo,rsi_hi,wick_tol_pct,max_loss,prev_green,hold_days,trend_mode,min_profit_pct=0.0):
     cutoff=(datetime.now(timezone.utc).date()-timedelta(days=days)).isoformat()
     candidates={}
     for inst,rows in cache.items():
@@ -121,34 +121,7 @@ def simulate(cache,days,rsi_lo,rsi_hi,wick_tol_pct,max_loss,prev_green,hold_days
                 if s.get("ema20") is None or s.get("ema50") is None or prev.get("ema20") is None: continue
                 if not (s["c"]>s["ema20"]>s["ema50"] and s["ema20"]>prev["ema20"]): continue
             score=(s["c"]-s["o"])/s["o"]*100 + (s["rsi"]-rsi_lo)/max(1,(rsi_hi-rsi_lo))
-            candidates.setdefault(nxt["day"],[]).append({"coin":inst,"signal":s,"entry_row":nxt,"score":score,"strategy":"HAMZA"})
-
-    # Independent DAILY EMA50 pullback-continuation candidates.
-    ema_candidates={}
-    for inst,rows in cache.items():
-        for i in range(1,len(rows)-1):
-            prev=rows[i-1]; s=rows[i]; nxt=rows[i+1]
-            if s["day"]<cutoff or s.get("rsi") is None: continue
-            if s.get("ema20") is None or s.get("ema50") is None or prev.get("ema50") is None: continue
-            if not (s["ema20"] > s["ema50"] and s["ema50"] >= prev["ema50"]): continue
-            if not (s["c"] > s["o"] and s["c"] > s["ema50"]): continue
-            d1=abs(s["l"]-s["ema50"])/s["ema50"]*100
-            d0=abs(prev["l"]-prev["ema50"])/prev["ema50"]*100
-            if min(d1,d0) > 1.0: continue
-            if not (45 < s["rsi"] < 62): continue
-            body=(s["c"]-s["o"])/s["o"]*100
-            if body > 4.0: continue
-            score2=(1-min(d1,1.0))+body*0.25+(s["rsi"]-45)/17
-            ema_candidates.setdefault(nxt["day"],[]).append({"coin":inst,"signal":s,"entry_row":nxt,"score":score2,"strategy":"EMA50"})
-
-    if strategy_mode=="EMA50":
-        candidates=ema_candidates
-    elif strategy_mode=="COMBO":
-        merged={}
-        for d in set(candidates)|set(ema_candidates):
-            # If HAMZA has a signal that day, preserve HAMZA priority; otherwise use EMA50.
-            merged[d]=candidates.get(d,[]) or ema_candidates.get(d,[])
-        candidates=merged
+            candidates.setdefault(nxt["day"],[]).append({"coin":inst,"signal":s,"entry_row":nxt,"score":score})
 
     equity=START_CAPITAL; peak=START_CAPITAL; maxdd=0.0
     trades=[]; open_pos=None
@@ -171,7 +144,7 @@ def simulate(cache,days,rsi_lo,rsi_hi,wick_tol_pct,max_loss,prev_green,hold_days
                     q=open_pos["qty"]
                     net=q*(exit_exec-open_pos["entry_exec"])-FEE*q*open_pos["entry_exec"]-FEE*q*exit_exec
                     equity+=net
-                    trades.append({"coin":open_pos["coin"],"strategy":open_pos.get("strategy","HAMZA"),"signal_day":open_pos["signal_day"],"entry_day":open_pos["entry_day"],"exit_day":day,"reason":reason,"net":net})
+                    trades.append({"coin":open_pos["coin"],"signal_day":open_pos["signal_day"],"entry_day":open_pos["entry_day"],"entry_price":open_pos["entry_raw"],"exit_day":day,"exit_price":exit_exec,"reason":reason,"net":net,"balance":equity})
                     open_pos=None
                     peak=max(peak,equity)
                     if peak>0:maxdd=max(maxdd,(peak-equity)/peak*100)
@@ -182,7 +155,7 @@ def simulate(cache,days,rsi_lo,rsi_hi,wick_tol_pct,max_loss,prev_green,hold_days
             notional=min(START_CAPITAL*LEVERAGE,equity*LEVERAGE)
             qty=notional/entry_exec
             sp=stop_price(entry_raw,entry_exec,qty,max_loss)
-            open_pos={"coin":pick["coin"],"strategy":pick.get("strategy","HAMZA"),"signal_day":pick["signal"]["day"],"entry_day":day,"entry_raw":entry_raw,"entry_exec":entry_exec,"qty":qty,"stop_raw":sp}
+            open_pos={"coin":pick["coin"],"signal_day":pick["signal"]["day"],"entry_day":day,"entry_raw":entry_raw,"entry_exec":entry_exec,"qty":qty,"stop_raw":sp}
 
             # same-day exit
             row=e; reason=None; exit_exec=None
@@ -193,17 +166,37 @@ def simulate(cache,days,rsi_lo,rsi_hi,wick_tol_pct,max_loss,prev_green,hold_days
             if reason:
                 net=qty*(exit_exec-entry_exec)-FEE*qty*entry_exec-FEE*qty*exit_exec
                 equity+=net
-                trades.append({"coin":open_pos["coin"],"strategy":open_pos.get("strategy","HAMZA"),"signal_day":open_pos["signal_day"],"entry_day":day,"exit_day":day,"reason":reason,"net":net})
+                trades.append({"coin":open_pos["coin"],"signal_day":open_pos["signal_day"],"entry_day":day,"entry_price":open_pos["entry_raw"],"exit_day":day,"exit_price":exit_exec,"reason":reason,"net":net,"balance":equity})
                 open_pos=None
                 peak=max(peak,equity)
                 if peak>0:maxdd=max(maxdd,(peak-equity)/peak*100)
 
     wins=sum(1 for t in trades if t["net"]>0)
+
+    # Month-wise breakup based on each trade's EXIT month.
+    monthly=[]
+    by_month={}
+    for tr in trades:
+        by_month.setdefault(tr["exit_day"][:7],[]).append(tr)
+    running=START_CAPITAL
+    for month in sorted(by_month):
+        mts=by_month[month]
+        pnl=sum(x["net"] for x in mts)
+        start_bal=running
+        running+=pnl
+        monthly.append({
+            "month":month,"trades":len(mts),
+            "wins":sum(1 for x in mts if x["net"]>0),
+            "losses":sum(1 for x in mts if x["net"]<=0),
+            "net_pnl":pnl,"start_balance":start_bal,"end_balance":running
+        })
+
     return {
         "trades":len(trades),"wins":wins,"win_rate":wins/len(trades)*100 if trades else 0,
         "net_pnl":equity-START_CAPITAL,"end_balance":equity,"max_dd":maxdd,
         "sl_hits":sum(1 for t in trades if "SL" in t["reason"]),
-        "profit_exits":sum(1 for t in trades if str(t["reason"]).startswith("EOD PROFIT"))
+        "profit_exits":sum(1 for t in trades if str(t["reason"]).startswith("EOD PROFIT")),
+        "trade_details":trades,"monthly":monthly
     }
 
 def run_test(days):
@@ -221,22 +214,40 @@ def run_test(days):
             except Exception:
                 pass
 
-        # HAMZA Best remains LOCKED; compare with an independent EMA50 pullback setup.
-        modes=["HAMZA","EMA50","COMBO"]
-        total=3
+        # 365D PROFIT IMPROVEMENT TEST
+        # Signal is LOCKED from validated winner:
+        # EMA20+EMA50 | RSI 52-62 | Wick 0.10% | Previous Green = Yes.
+        # Only risk/exit management changes.
+        rsi_ranges=[(52,63)]
+        wick_tols=[0.05]
+        max_losses=[2.75]
+        prev_opts=[True]
+        hold_days_list=[3]
+        trend_modes=["EMA20+EMA50"]
+        min_profit_pcts=[0.60]
+        total=1
         results=[]; n=0
-        for mode in modes:
-            n+=1
-            with lock: state["test"]["progress"]=f"Testing {mode} {n}/3"
-            r=simulate(cache,days,52,63,0.05,2.75,True,3,"EMA20+EMA50",0.60,mode)
-            r.update({"trend":mode,"rsi":"52-63" if mode=="HAMZA" else "Mixed",
-                      "wick_tol":0.05 if mode=="HAMZA" else "",
-                      "max_loss":2.75,"prev_green":True if mode=="HAMZA" else "",
-                      "hold_days":3,"min_profit_pct":0.60,"strategy_mode":mode})
-            r["monthly_avg"]=r["net_pnl"]/12.0
-            r["target_gap"]=r["net_pnl"]-360.0
-            r["target_hit"]=r["net_pnl"]>=360.0
-            results.append(r)
+
+        for rr in rsi_ranges:
+            for wt in wick_tols:
+                for ml in max_losses:
+                    for pg in prev_opts:
+                        for hd in hold_days_list:
+                            for tm in trend_modes:
+                                for mp in min_profit_pcts:
+                                    n+=1
+                                    with lock:
+                                        state["test"]["progress"]=f"Testing profit variant {n}/{total}"
+                                    r=simulate(cache,days,rr[0],rr[1],wt,ml,pg,hd,tm,mp)
+                                    r.update({
+                                        "rsi":f"{rr[0]}-{rr[1]}","wick_tol":wt,
+                                        "max_loss":ml,"prev_green":pg,"hold_days":hd,
+                                        "trend":tm,"min_profit_pct":mp
+                                    })
+                                    r["monthly_avg"] = r["net_pnl"]/12.0
+                                    r["target_gap"] = r["net_pnl"]-360.0
+                                    r["target_hit"] = r["net_pnl"] >= 360.0
+                                    results.append(r)
 
         # Stability score: prefer profit with lower drawdown and enough trades.
         for x in results:
@@ -271,13 +282,40 @@ def download_results():
         result=state["test"].get("result")
     if not result:
         return Response("Pehle backtest complete karein.",status=400,mimetype="text/plain")
+    rows=result.get("top",[])
+    if not rows:
+        return Response("Result nahi mila.",status=400,mimetype="text/plain")
+    x=rows[0]
     out=io.StringIO()
     w=csv.writer(out)
-    w.writerow(["Rank","Trend Filter","RSI","Wick Tol %","SL $","Prev Green","Max Hold Days","Min EOD Profit %","Trades","Wins","Win Rate %","EOD Profit","SL Hits","Net P/L $","End Balance $","Max DD %","Score"])
-    for i,x in enumerate(result.get("top",[]),1):
-        w.writerow([i,x.get("trend"),x.get("rsi"),x.get("wick_tol"),x.get("max_loss"),"Yes" if x.get("prev_green") else "No",x.get("hold_days"),x.get("min_profit_pct",0),x.get("trades"),x.get("wins"),round(x.get("win_rate",0),2),x.get("profit_exits"),x.get("sl_hits"),round(x.get("net_pnl",0),4),round(x.get("end_balance",0),4),round(x.get("max_dd",0),2),round(x.get("score",0),2)])
-    name=f"hamza_combo_test_{result.get('days',365)}days_results.csv"
-    return Response(out.getvalue(),mimetype="text/csv",headers={"Content-Disposition":f"attachment; filename={name}"})
+
+    w.writerow(["HAMZA BEST STRATEGY - DETAILED REPORT"])
+    w.writerow(["EMA20+EMA50 | RSI 52-63 | Wick 0.05% | SL $2.75 | Previous Green Yes | Hold 3 Days | Min EOD Profit 0.60%"])
+    w.writerow([])
+    w.writerow(["OVERALL SUMMARY"])
+    w.writerow(["Trades","Profit Trades","Loss Trades","Win Rate %","EOD Profit","SL Hits","Net P/L $","End Balance $","Max DD %"])
+    w.writerow([x.get("trades"),x.get("wins"),x.get("trades",0)-x.get("wins",0),round(x.get("win_rate",0),2),
+                x.get("profit_exits"),x.get("sl_hits"),round(x.get("net_pnl",0),4),
+                round(x.get("end_balance",0),4),round(x.get("max_dd",0),2)])
+
+    w.writerow([])
+    w.writerow(["MONTH-WISE BREAKUP"])
+    w.writerow(["Month","Trades","Profit Trades","Loss Trades","Net P/L $","Starting Balance $","Ending Balance $"])
+    for m in x.get("monthly",[]):
+        w.writerow([m["month"],m["trades"],m["wins"],m["losses"],round(m["net_pnl"],4),
+                    round(m["start_balance"],4),round(m["end_balance"],4)])
+
+    w.writerow([])
+    w.writerow(["TRADE-WISE DETAIL"])
+    w.writerow(["Trade #","Coin","Signal Date","Entry Date","Entry Price","Exit Date","Exit Price","Exit Reason","P/L $","Running Balance $"])
+    for i,tr in enumerate(x.get("trade_details",[]),1):
+        w.writerow([i,tr.get("coin"),tr.get("signal_day"),tr.get("entry_day"),
+                    round(tr.get("entry_price",0),8),tr.get("exit_day"),round(tr.get("exit_price",0),8),
+                    tr.get("reason"),round(tr.get("net",0),4),round(tr.get("balance",0),4)])
+
+    name=f"hamza_best_{result.get('days',365)}days_month_trade_report.csv"
+    return Response(out.getvalue(),mimetype="text/csv",
+                    headers={"Content-Disposition":f"attachment; filename={name}"})
 
 @app.get("/api/status")
 def status():
@@ -292,11 +330,11 @@ button{padding:12px 18px;border:0;border-radius:9px;background:#387df3;color:whi
 table{width:100%;border-collapse:collapse}th,td{padding:9px;border-bottom:1px solid #253645;text-align:right;white-space:nowrap}
 th:first-child,td:first-child{text-align:left}.scroll{overflow:auto}.g{color:#6ff0a0}.r{color:#ff9999}
 </style></head><body><div class=w>
-<div class=c><h2>HAMZA STRATEGY COMBO TEST V1</h2>
-<div class=sub>Signal rules LOCKED hain: EMA20+EMA50, RSI 52–62, Wick 0.10%, Previous Green = Yes. Ab sirf profit/risk management test hoga: HAMZA Best Strategy bilkul LOCKED hai. Saath independent DAILY EMA50 Pullback setup test hoga. 3 results: HAMZA only, EMA50 only, aur COMBO. Combo ek waqt mein 1 position rakhega; same-day conflict mein HAMZA ko priority milegi. Target +$360/year hai. Sab OKX USDT pairs scan honge.</div></div>
+<div class=c><h2>HAMZA BEST — MONTH & TRADE REPORT</h2>
+<div class=sub>Signal rules LOCKED hain: EMA20+EMA50, RSI 52–62, Wick 0.10%, Previous Green = Yes. Ab sirf profit/risk management test hoga: HAMZA Best Strategy LOCKED hai. Strategy rules bilkul change nahi honge. Download CSV mein Overall Summary + Month-wise Breakup + har individual Trade ki Signal Date, Entry/Exit Price, P/L aur Running Balance milega. Sab OKX USDT pairs scan honge.</div></div>
 <div class=c><b>Backtest Days</b><br><br><input id=days type=number value=365 min=10 max=365>
-<button onclick=run()>Run Combo Strategy Test</button> <button id=dl onclick="location.href='/api/download'" style="background:#18a66a">Download Combo Results</button><div id=msg class=sub style="margin-top:12px"></div><div id=info class=sub></div></div>
-<div class="c scroll"><h3>Combo Results</h3><table><thead><tr>
+<button onclick=run()>Run 365D Detailed Report</button> <button id=dl onclick="location.href='/api/download'" style="background:#18a66a">Download Month + Trade CSV</button><div id=msg class=sub style="margin-top:12px"></div><div id=info class=sub></div></div>
+<div class="c scroll"><h3>HAMZA Best Detailed Result</h3><table><thead><tr>
 <th>#</th><th>Trend Filter</th><th>RSI</th><th>Wick Tol</th><th>SL</th><th>Prev Green</th><th>Max Hold</th><th>Min EOD Profit</th><th>Trades</th><th>WR</th><th>EOD Profit</th><th>SL Hits</th><th>Net P/L</th><th>End</th><th>Max DD</th><th>Score</th>
 </tr></thead><tbody id=tb></tbody></table></div>
 </div><script>
