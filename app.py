@@ -176,9 +176,9 @@ def run_test(days):
         # Focused variants around user's current strategy.
         # FAST FINE-TUNE grid around the strongest profitable zone.
         # 120 focused variants, still scanning ALL OKX USDT pairs.
-        rsi_ranges=[(50,60),(50,61),(50,62),(51,60),(51,61),(51,62)]
-        wick_tols=[0.0,0.05,0.10,0.15]
-        max_losses=[3.0,4.0,5.0,6.0,7.0]
+        rsi_ranges=[(51,62)]
+        wick_tols=[0.05]
+        max_losses=[3.0]
         prev_opts=[True]
         hold_days_list=[1]
         total=len(rsi_ranges)*len(wick_tols)*len(max_losses)*len(prev_opts)*len(hold_days_list)
@@ -207,7 +207,7 @@ def run_test(days):
                 "result":{
                     "days":days,"pairs_found":len(coins),"pairs_loaded":len(cache),
                     "variants":total,"profitable":sum(1 for x in results if x["net_pnl"]>0),
-                    "top":results[:20]
+                    "top":results[:1]
                 }
             })
     except Exception as e:
@@ -235,11 +235,11 @@ button{padding:12px 18px;border:0;border-radius:9px;background:#387df3;color:whi
 table{width:100%;border-collapse:collapse}th,td{padding:9px;border-bottom:1px solid #253645;text-align:right;white-space:nowrap}
 th:first-child,td:first-child{text-align:left}.scroll{overflow:auto}.g{color:#6ff0a0}.r{color:#ff9999}
 </style></head><body><div class=w>
-<div class=c><h2>Current Strategy — FAST Fine-Tune</h2>
-<div class=sub>FAST fine-tune: sab OKX USDT pairs scan honge. 120 focused variants RSI 50–62 zone, wick 0–0.15% aur $3–$7 SL ke andar test honge. Previous candle green fixed hai. Ranking profit ke saath drawdown ko bhi penalize karti hai.</div></div>
+<div class=c><h2>Winner Strategy — Validation</h2>
+<div class=sub>Winner validation: #1 setup fixed hai — RSI 51–62, Wick Tol 0.05%, SL $3, Previous candle Green = Yes, Max Hold = 1 day. Sab OKX USDT pairs scan honge. Backtest days change karke isi exact setup ko validate karein.</div></div>
 <div class=c><b>Backtest Days</b><br><br><input id=days type=number value=60 min=10 max=180>
-<button onclick=run()>Run Fine-Tune</button><div id=msg class=sub style="margin-top:12px"></div><div id=info class=sub></div></div>
-<div class="c scroll"><h3>Top 20 Variants</h3><table><thead><tr>
+<button onclick=run()>Run Winner Backtest</button><div id=msg class=sub style="margin-top:12px"></div><div id=info class=sub></div></div>
+<div class="c scroll"><h3>Winner Result</h3><table><thead><tr>
 <th>#</th><th>RSI</th><th>Wick Tol</th><th>SL</th><th>Prev Green</th><th>Max Hold</th><th>Trades</th><th>WR</th><th>EOD Profit</th><th>SL Hits</th><th>Net P/L</th><th>End</th><th>Max DD</th><th>Score</th>
 </tr></thead><tbody id=tb></tbody></table></div>
 </div><script>
