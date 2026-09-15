@@ -70,18 +70,22 @@ def work(from_date,to_date):
         cmd(["freqtrade","download-data","--config",str(CONFIG),"--timeframes","5m","--timerange",tr,"--data-format-ohlcv","csv"])
         with LOCK: STATE.update(status="Packing candle files into ZIP...",progress=85)
 
-        data_root=UD/"data"/"okx"
-        if not data_root.exists(): raise RuntimeError("OKX data folder not found after download.")
+        data_root=UD/"data"
+        if not data_root.exists(): raise RuntimeError("Freqtrade data folder not found after download.")
+        csv_files=list(data_root.rglob("*.csv"))
+        if not csv_files:
+            # Helpful diagnostic if Freqtrade stored files elsewhere/under another extension.
+            found=[str(f.relative_to(UD)) for f in data_root.rglob("*") if f.is_file()]
+            raise RuntimeError("CSV files not found. Files present: "+", ".join(found[:20]))
         zp=UD/f"OKX_5m_CSV_{start:%Y%m%d}_{end:%Y%m%d}_Top20.zip"
         with zipfile.ZipFile(zp,"w",zipfile.ZIP_DEFLATED) as z:
             manifest=["OKX 5m CSV candle export",f"From: {from_date}",f"To: {to_date}","Pairs:"]+ps
             z.writestr("MANIFEST.txt","\\n".join(manifest))
             count=0
-            for f in data_root.rglob("*"):
-                if f.is_file():
-                    z.write(f,arcname=str(Path("data")/f.relative_to(data_root)))
-                    count+=1
-        if count==0: raise RuntimeError("No candle files were downloaded.")
+            for f in csv_files:
+                z.write(f,arcname=str(Path("data")/f.relative_to(data_root)))
+                count+=1
+        if count==0: raise RuntimeError("No CSV candle files were downloaded.")
         with LOCK: STATE.update(running=False,status=f"Completed - {count} data files ready",progress=100,data_zip=str(zp))
     except Exception as e:
         with LOCK: STATE.update(running=False,status="Failed",progress=100,error=str(e))
