@@ -200,11 +200,11 @@ def run_test(days):
         # Only risk/exit management changes.
         rsi_ranges=[(52,62)]
         wick_tols=[0.10]
-        max_losses=[2.0,2.5,3.0,3.5,4.0]
+        max_losses=[1.5,2.0,2.5,3.0,3.5]
         prev_opts=[True]
         hold_days_list=[1,2,3]
         trend_modes=["EMA20+EMA50"]
-        min_profit_pcts=[0.0,0.25,0.50,0.75]
+        min_profit_pcts=[0.0,0.25,0.50,0.75,1.0]
         total=len(max_losses)*len(hold_days_list)*len(min_profit_pcts)
         results=[]; n=0
 
@@ -281,7 +281,7 @@ table{width:100%;border-collapse:collapse}th,td{padding:9px;border-bottom:1px so
 th:first-child,td:first-child{text-align:left}.scroll{overflow:auto}.g{color:#6ff0a0}.r{color:#ff9999}
 </style></head><body><div class=w>
 <div class=c><h2>365D Winner — Profit Improvement Test</h2>
-<div class=sub>Signal rules LOCKED hain: EMA20+EMA50, RSI 52–62, Wick 0.10%, Previous Green = Yes. Ab sirf profit/risk management test hoga: SL $2–$4, Hold 1–3 days aur minimum EOD profit 0–0.75%. Sab OKX USDT pairs scan honge.</div></div>
+<div class=sub>Signal rules LOCKED hain: EMA20+EMA50, RSI 52–62, Wick 0.10%, Previous Green = Yes. Ab sirf profit/risk management test hoga: SL $1.5–$3.5, Hold 1–3 days aur minimum EOD profit 0–1.0%. Sab OKX USDT pairs scan honge.</div></div>
 <div class=c><b>Backtest Days</b><br><br><input id=days type=number value=365 min=10 max=365>
 <button onclick=run()>Run 365D Profit Test</button> <button id=dl onclick="location.href='/api/download'" style="background:#18a66a">Download Full Profit-Test CSV</button><div id=msg class=sub style="margin-top:12px"></div><div id=info class=sub></div></div>
 <div class="c scroll"><h3>Top Profit/Risk Variants</h3><table><thead><tr>
