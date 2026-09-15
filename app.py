@@ -1,18 +1,24 @@
-import os,json,subprocess,threading,csv
+import os,json,subprocess,threading,csv,zipfile
 from http.server import ThreadingHTTPServer,BaseHTTPRequestHandler
 from urllib.request import urlopen,Request
 from pathlib import Path
 from datetime import datetime,timedelta,timezone
 
 BASE=Path("/app"); UD=BASE/"user_data"; STRAT=UD/"strategies"/"GeneticEngineV1.py"; CONFIG=UD/"config.json"; RESULT=UD/"backtest_results"
-STATE={"running":False,"status":"Ready","progress":0,"error":"","summary":None,"report":None}; LOCK=threading.Lock()
+STATE={"running":False,"status":"Ready","progress":0,"error":"","summary":None,"report":None,"data_zip":None}; LOCK=threading.Lock()
 
-HTML="""<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>GeneticEngineV1 Date Range</title>
-<style>body{font-family:Arial;background:#0b1220;color:#e8eef9;padding:18px}.card{max-width:800px;margin:auto;background:#121c2e;padding:20px;border-radius:16px}button{background:#2878ed;color:white;border:0;padding:14px 18px;border-radius:10px;font-weight:bold}.bar{height:12px;background:#26344b;border-radius:8px;overflow:hidden}.fill{height:100%;background:#2878ed}.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.box{background:#0c1525;padding:12px;border-radius:10px}.muted{color:#9db0cb}a{color:#7fb1ff}pre{white-space:pre-wrap}</style></head>
-<body><div class="card"><h1>GeneticEngineV1 - Date Range Backtest</h1><p class="muted">Original GitHub strategy | 5m | OKX Spot | $100 start | Max 5 open trades | Top 20 USDT pairs | Select any From/To date range</p>
-<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:14px 0"><label>From Date<br><input id="fromdate" type="date" style="width:100%;padding:10px;margin-top:5px"></label><label>To Date<br><input id="todate" type="date" style="width:100%;padding:10px;margin-top:5px"></label></div><button id="run" onclick="go()">Run Date Range</button><p id="st">Ready</p><div class="bar"><div id="fill" class="fill" style="width:0%"></div></div><div id="sum"></div>
-<p><a id="dl" href="/download" style="display:none">Download Trade-wise CSV</a></p><pre id="err"></pre></div>
-<script>async function go(){if(!fromdate.value||!todate.value){alert('From aur To date select karein');return}if(fromdate.value>todate.value){alert('From Date, To Date se pehle honi chahiye');return}run.disabled=true;await fetch('/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({from:fromdate.value,to:todate.value})});poll()}async function poll(){let x=await(await fetch('/status')).json();st.textContent=x.status;fill.style.width=x.progress+'%';if(x.summary){let s=x.summary;sum.innerHTML='<div class="grid"><div class="box"><b>Trades</b><br>'+s.trades+'</div><div class="box"><b>Net P/L</b><br>$'+s.profit_abs+'</div><div class="box"><b>End Balance</b><br>$'+s.end_balance+'</div><div class="box"><b>Win Rate</b><br>'+s.win_rate+'%</div><div class="box"><b>Max DD</b><br>'+s.max_dd+'%</div><div class="box"><b>Pairs</b><br>'+s.pairs+'</div></div>';dl.style.display='inline'}if(x.error)err.textContent=x.error;if(x.running)setTimeout(poll,2500);else run.disabled=false}poll()</script></body></html>"""
+HTML="""<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>OKX 5m Data Export</title>
+<style>body{font-family:Arial;background:#0b1220;color:#e8eef9;padding:18px}.card{max-width:800px;margin:auto;background:#121c2e;padding:20px;border-radius:16px}button{background:#2878ed;color:white;border:0;padding:14px 18px;border-radius:10px;font-weight:bold;font-size:16px}input{box-sizing:border-box;width:100%;padding:12px;font-size:16px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.muted{color:#9db0cb}a{color:#7fb1ff;font-size:18px}.bar{height:12px;background:#26344b;border-radius:8px;overflow:hidden}.fill{height:100%;background:#2878ed}</style></head>
+<body><div class="card"><h1>OKX 5m Candle Data Export</h1>
+<p class="muted">Top 20 USDT pairs | Select From/To dates | Downloads raw 5-minute market data only. No backtest.</p>
+<div class="grid"><label>From Date<br><input id="fd" type="date"></label><label>To Date<br><input id="td" type="date"></label></div><br>
+<button id="run" onclick="go()">Download Market Data</button>
+<p id="st">Ready</p><div class="bar"><div id="fill" class="fill" style="width:0%"></div></div>
+<p><a id="dl" href="/download-data" style="display:none">Download Candle Data ZIP</a></p><pre id="err"></pre></div>
+<script>
+async function go(){if(!fd.value||!td.value){alert('From aur To date select karein');return}if(fd.value>td.value){alert('Date range check karein');return}run.disabled=true;dl.style.display='none';err.textContent='';await fetch('/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({from:fd.value,to:td.value})});poll()}
+async function poll(){let x=await(await fetch('/status')).json();st.textContent=x.status;fill.style.width=x.progress+'%';if(x.ready)dl.style.display='inline';if(x.error)err.textContent=x.error;if(x.running)setTimeout(poll,2000);else run.disabled=false}poll()
+</script></body></html>"""
 
 def cmd(a,timeout=7200):
     p=subprocess.run(a,cwd=BASE,text=True,capture_output=True,timeout=timeout)
@@ -53,22 +59,30 @@ def parse(path,ps):
 
 def work(from_date,to_date):
     try:
-        with LOCK: STATE.update(running=True,status="Finding top 20 OKX pairs...",progress=5,error="",summary=None,report=None)
+        with LOCK: STATE.update(running=True,status="Finding top 20 OKX pairs...",progress=5,error="",data_zip=None)
         ps=pairs(); config(ps)
         start=datetime.strptime(from_date,"%Y-%m-%d").date()
         end=datetime.strptime(to_date,"%Y-%m-%d").date()
         if start>end: raise RuntimeError("From Date must be before To Date.")
         if end>datetime.now(timezone.utc).date(): raise RuntimeError("To Date future mein nahi ho sakti.")
         tr=f"{start:%Y%m%d}-{end:%Y%m%d}"
-        with LOCK: STATE.update(status="Downloading 5m candles...",progress=15)
+        with LOCK: STATE.update(status=f"Downloading 5m candles for {len(ps)} pairs...",progress=20)
         cmd(["freqtrade","download-data","--config",str(CONFIG),"--timeframes","5m","--timerange",tr])
-        with LOCK: STATE.update(status="Running GeneticEngineV1...",progress=55)
-        RESULT.mkdir(parents=True,exist_ok=True); out=RESULT/"genetic.json"
-        cmd(["freqtrade","backtesting","--config",str(CONFIG),"--strategy-path",str(STRAT.parent),"--strategy","GeneticEngineV1","--timeframe","5m","--timerange",tr,"--export","trades","--export-filename",str(out)])
-        candidates=sorted(RESULT.glob("*.json"),key=lambda p:p.stat().st_mtime,reverse=True)
-        if not candidates: raise RuntimeError("Backtest result JSON not found.")
-        sm,rp=parse(candidates[0],ps)
-        with LOCK: STATE.update(running=False,status="Completed",progress=100,summary=sm,report=rp)
+        with LOCK: STATE.update(status="Packing candle files into ZIP...",progress=85)
+
+        data_root=UD/"data"/"okx"
+        if not data_root.exists(): raise RuntimeError("OKX data folder not found after download.")
+        zp=UD/f"OKX_5m_{start:%Y%m%d}_{end:%Y%m%d}_Top20.zip"
+        with zipfile.ZipFile(zp,"w",zipfile.ZIP_DEFLATED) as z:
+            manifest=["OKX 5m candle export",f"From: {from_date}",f"To: {to_date}","Pairs:"]+ps
+            z.writestr("MANIFEST.txt","\\n".join(manifest))
+            count=0
+            for f in data_root.rglob("*"):
+                if f.is_file():
+                    z.write(f,arcname=str(Path("data")/f.relative_to(data_root)))
+                    count+=1
+        if count==0: raise RuntimeError("No candle files were downloaded.")
+        with LOCK: STATE.update(running=False,status=f"Completed - {count} data files ready",progress=100,data_zip=str(zp))
     except Exception as e:
         with LOCK: STATE.update(running=False,status="Failed",progress=100,error=str(e))
 
@@ -80,8 +94,15 @@ class H(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path=="/": return self.sendx(HTML.encode())
         if self.path=="/status":
-            with LOCK:x={k:v for k,v in STATE.items() if k!="report"}
+            with LOCK:
+                x={k:v for k,v in STATE.items() if k not in ("report","data_zip")}
+                x["ready"]=bool(STATE.get("data_zip"))
             return self.sendx(json.dumps(x).encode(),"application/json")
+        if self.path=="/download-data":
+            with LOCK: z=STATE.get("data_zip")
+            if z and Path(z).exists():
+                return self.sendx(Path(z).read_bytes(),"application/zip",200,{"Content-Disposition":f'attachment; filename="{Path(z).name}"'})
+            return self.sendx(b"No candle ZIP ready","text/plain",404)
         if self.path=="/download":
             with LOCK:r=STATE.get("report")
             if r and Path(r).exists(): return self.sendx(Path(r).read_bytes(),"text/csv",200,{"Content-Disposition":'attachment; filename="genetic_engine_v1_365d_trades.csv"'})
