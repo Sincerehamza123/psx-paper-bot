@@ -197,12 +197,12 @@ def run_test(days):
         # Focused variants around user's current strategy.
         # FAST FINE-TUNE grid around the strongest profitable zone.
         # 120 focused variants, still scanning ALL OKX USDT pairs.
-        rsi_ranges=[(51,62)]
-        wick_tols=[0.05]
-        max_losses=[3.0]
+        rsi_ranges=[(49,60),(49,61),(49,62),(50,60),(50,61),(50,62),(51,60),(51,61),(51,62),(52,61),(52,62),(52,63)]
+        wick_tols=[0.00,0.05,0.10,0.15]
+        max_losses=[2.0,3.0,4.0,5.0]
         prev_opts=[True]
         hold_days_list=[1]
-        trend_modes=["NONE","EMA20","EMA20+EMA50"]
+        trend_modes=["EMA20+EMA50"]
         total=len(rsi_ranges)*len(wick_tols)*len(max_losses)*len(prev_opts)*len(hold_days_list)*len(trend_modes)
         results=[]; n=0
 
@@ -250,7 +250,7 @@ def status():
     with lock:return jsonify(state["test"])
 
 HTML=r"""<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Winner Trend Filter Comparison</title><style>
+<title>EMA20+EMA50 Fine Tune</title><style>
 body{margin:0;background:#071019;color:#eef6ff;font-family:Arial;padding:14px}.w{max-width:1100px;margin:auto}
 .c{background:#111d29;border:1px solid #27394b;border-radius:14px;padding:16px;margin-bottom:12px}.sub{color:#a8bacb;line-height:1.5}
 input{width:120px;padding:11px;border-radius:8px;border:1px solid #3b4d60;background:#09141e;color:white;font-size:17px}
@@ -258,10 +258,10 @@ button{padding:12px 18px;border:0;border-radius:9px;background:#387df3;color:whi
 table{width:100%;border-collapse:collapse}th,td{padding:9px;border-bottom:1px solid #253645;text-align:right;white-space:nowrap}
 th:first-child,td:first-child{text-align:left}.scroll{overflow:auto}.g{color:#6ff0a0}.r{color:#ff9999}
 </style></head><body><div class=w>
-<div class=c><h2>Winner Strategy — Trend Filter Comparison</h2>
-<div class=sub>Exact winner rules fixed hain: RSI 51–62, Wick Tol 0.05%, SL $3, Previous candle Green = Yes, Max Hold = 1 day. Sirf trend filter compare hoga: No Filter vs EMA20 vs EMA20+EMA50. Sab OKX USDT pairs scan honge.</div></div>
+<div class=c><h2>EMA20+EMA50 — 180D Fine Tune</h2>
+<div class=sub>EMA20+EMA50 trend filter fixed hai. Ab RSI, Wick Tol aur SL ko fine-tune karega. Previous candle Green = Yes aur Max Hold = 1 day fixed hain. Sab OKX USDT pairs scan honge.</div></div>
 <div class=c><b>Backtest Days</b><br><br><input id=days type=number value=180 min=10 max=180>
-<button onclick=run()>Compare 3 Trend Filters</button><div id=msg class=sub style="margin-top:12px"></div><div id=info class=sub></div></div>
+<button onclick=run()>Run 180D Fine-Tune</button><div id=msg class=sub style="margin-top:12px"></div><div id=info class=sub></div></div>
 <div class="c scroll"><h3>Winner Result</h3><table><thead><tr>
 <th>#</th><th>Trend Filter</th><th>RSI</th><th>Wick Tol</th><th>SL</th><th>Prev Green</th><th>Max Hold</th><th>Trades</th><th>WR</th><th>EOD Profit</th><th>SL Hits</th><th>Net P/L</th><th>End</th><th>Max DD</th><th>Score</th>
 </tr></thead><tbody id=tb></tbody></table></div>
