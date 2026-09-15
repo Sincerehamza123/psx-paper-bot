@@ -200,11 +200,11 @@ def run_test(days):
         # Only risk/exit management changes.
         rsi_ranges=[(52,62)]
         wick_tols=[0.10]
-        max_losses=[1.5,2.0,2.5,3.0,3.5]
+        max_losses=[2.00,2.25,2.50,2.75,3.00]
         prev_opts=[True]
-        hold_days_list=[1,2,3]
+        hold_days_list=[2,3,4,5]
         trend_modes=["EMA20+EMA50"]
-        min_profit_pcts=[0.0,0.25,0.50,0.75,1.0]
+        min_profit_pcts=[0.0,0.10,0.20,0.30,0.40,0.50,0.75,1.0]
         total=len(max_losses)*len(hold_days_list)*len(min_profit_pcts)
         results=[]; n=0
 
@@ -224,11 +224,14 @@ def run_test(days):
                                         "max_loss":ml,"prev_green":pg,"hold_days":hd,
                                         "trend":tm,"min_profit_pct":mp
                                     })
+                                    r["monthly_avg"] = r["net_pnl"]/12.0
+                                    r["target_gap"] = r["net_pnl"]-360.0
+                                    r["target_hit"] = r["net_pnl"] >= 360.0
                                     results.append(r)
 
         # Stability score: prefer profit with lower drawdown and enough trades.
         for x in results:
-            x["score"] = x["net_pnl"] - 2.0*x["max_dd"] + min(x["trades"],40)*0.15
+            x["score"] = x["net_pnl"] - 1.5*x["max_dd"] - max(0,x["max_dd"]-25)*4.0 + min(x["trades"],40)*0.15
         results.sort(key=lambda x:(x["trades"]>=3,x["score"],x["net_pnl"],-x["max_dd"]),reverse=True)
 
         with lock:
@@ -238,7 +241,7 @@ def run_test(days):
                 "result":{
                     "days":days,"pairs_found":len(coins),"pairs_loaded":len(cache),
                     "variants":total,"profitable":sum(1 for x in results if x["net_pnl"]>0),
-                    "top":results[:30]
+                    "top":results[:50]
                 }
             })
     except Exception as e:
@@ -261,7 +264,7 @@ def download_results():
         return Response("Pehle backtest complete karein.",status=400,mimetype="text/plain")
     out=io.StringIO()
     w=csv.writer(out)
-    w.writerow(["Rank","Trend Filter","RSI","Wick Tol %","SL $","Prev Green","Max Hold Days","Trades","Wins","Win Rate %","EOD Profit","SL Hits","Net P/L $","End Balance $","Max DD %","Score"])
+    w.writerow(["Rank","Trend Filter","RSI","Wick Tol %","SL $","Prev Green","Max Hold Days","Min EOD Profit %","Trades","Wins","Win Rate %","EOD Profit","SL Hits","Net P/L $","End Balance $","Max DD %","Score"])
     for i,x in enumerate(result.get("top",[]),1):
         w.writerow([i,x.get("trend"),x.get("rsi"),x.get("wick_tol"),x.get("max_loss"),"Yes" if x.get("prev_green") else "No",x.get("hold_days"),x.get("trades"),x.get("wins"),round(x.get("win_rate",0),2),x.get("profit_exits"),x.get("sl_hits"),round(x.get("net_pnl",0),4),round(x.get("end_balance",0),4),round(x.get("max_dd",0),2),round(x.get("score",0),2)])
     name=f"winner_validation_{result.get('days',365)}days_full_results.csv"
@@ -280,11 +283,11 @@ button{padding:12px 18px;border:0;border-radius:9px;background:#387df3;color:whi
 table{width:100%;border-collapse:collapse}th,td{padding:9px;border-bottom:1px solid #253645;text-align:right;white-space:nowrap}
 th:first-child,td:first-child{text-align:left}.scroll{overflow:auto}.g{color:#6ff0a0}.r{color:#ff9999}
 </style></head><body><div class=w>
-<div class=c><h2>365D Winner — Profit Improvement Test</h2>
-<div class=sub>Signal rules LOCKED hain: EMA20+EMA50, RSI 52–62, Wick 0.10%, Previous Green = Yes. Ab sirf profit/risk management test hoga: SL $1.5–$3.5, Hold 1–3 days aur minimum EOD profit 0–1.0%. Sab OKX USDT pairs scan honge.</div></div>
+<div class=c><h2>365D — $30/Month Target Research</h2>
+<div class=sub>Signal rules LOCKED hain: EMA20+EMA50, RSI 52–62, Wick 0.10%, Previous Green = Yes. Ab sirf profit/risk management test hoga: Signal rules fixed hain. SL $2.00–$3.00, Hold 2–5 days aur minimum EOD profit 0–1.0% test hoga. Target benchmark $360/year (+$30/month average) hai; result guarantee nahi. Sab OKX USDT pairs scan honge.</div></div>
 <div class=c><b>Backtest Days</b><br><br><input id=days type=number value=365 min=10 max=365>
-<button onclick=run()>Run 365D Profit Test</button> <button id=dl onclick="location.href='/api/download'" style="background:#18a66a">Download Full Profit-Test CSV</button><div id=msg class=sub style="margin-top:12px"></div><div id=info class=sub></div></div>
-<div class="c scroll"><h3>Top Profit/Risk Variants</h3><table><thead><tr>
+<button onclick=run()>Run 365D $30/Month Target Test</button> <button id=dl onclick="location.href='/api/download'" style="background:#18a66a">Download Full Profit-Test CSV</button><div id=msg class=sub style="margin-top:12px"></div><div id=info class=sub></div></div>
+<div class="c scroll"><h3>Best Variants vs $360/Year Target</h3><table><thead><tr>
 <th>#</th><th>Trend Filter</th><th>RSI</th><th>Wick Tol</th><th>SL</th><th>Prev Green</th><th>Max Hold</th><th>Min EOD Profit</th><th>Trades</th><th>WR</th><th>EOD Profit</th><th>SL Hits</th><th>Net P/L</th><th>End</th><th>Max DD</th><th>Score</th>
 </tr></thead><tbody id=tb></tbody></table></div>
 </div><script>
