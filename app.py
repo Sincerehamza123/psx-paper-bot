@@ -9,8 +9,8 @@ STATE={"running":False,"status":"Ready","progress":0,"error":"","summary":None,"
 
 HTML="""<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>OKX 5m Data Export</title>
 <style>body{font-family:Arial;background:#0b1220;color:#e8eef9;padding:18px}.card{max-width:800px;margin:auto;background:#121c2e;padding:20px;border-radius:16px}button{background:#2878ed;color:white;border:0;padding:14px 18px;border-radius:10px;font-weight:bold;font-size:16px}input{box-sizing:border-box;width:100%;padding:12px;font-size:16px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.muted{color:#9db0cb}a{color:#7fb1ff;font-size:18px}.bar{height:12px;background:#26344b;border-radius:8px;overflow:hidden}.fill{height:100%;background:#2878ed}</style></head>
-<body><div class="card"><h1>OKX 5m Candle Data Export</h1>
-<p class="muted">Top 20 USDT pairs | Select From/To dates | Downloads raw 5-minute market data only. No backtest.</p>
+<body><div class="card"><h1>OKX 5m CSV Data Export</h1>
+<p class="muted">Top 20 USDT pairs | Select From/To dates | Downloads raw 5-minute candles directly as CSV. No backtest.</p>
 <div class="grid"><label>From Date<br><input id="fd" type="date"></label><label>To Date<br><input id="td" type="date"></label></div><br>
 <button id="run" onclick="go()">Download Market Data</button>
 <p id="st">Ready</p><div class="bar"><div id="fill" class="fill" style="width:0%"></div></div>
@@ -67,14 +67,14 @@ def work(from_date,to_date):
         if end>datetime.now(timezone.utc).date(): raise RuntimeError("To Date future mein nahi ho sakti.")
         tr=f"{start:%Y%m%d}-{end:%Y%m%d}"
         with LOCK: STATE.update(status=f"Downloading 5m candles for {len(ps)} pairs...",progress=20)
-        cmd(["freqtrade","download-data","--config",str(CONFIG),"--timeframes","5m","--timerange",tr])
+        cmd(["freqtrade","download-data","--config",str(CONFIG),"--timeframes","5m","--timerange",tr,"--data-format-ohlcv","csv"])
         with LOCK: STATE.update(status="Packing candle files into ZIP...",progress=85)
 
         data_root=UD/"data"/"okx"
         if not data_root.exists(): raise RuntimeError("OKX data folder not found after download.")
-        zp=UD/f"OKX_5m_{start:%Y%m%d}_{end:%Y%m%d}_Top20.zip"
+        zp=UD/f"OKX_5m_CSV_{start:%Y%m%d}_{end:%Y%m%d}_Top20.zip"
         with zipfile.ZipFile(zp,"w",zipfile.ZIP_DEFLATED) as z:
-            manifest=["OKX 5m candle export",f"From: {from_date}",f"To: {to_date}","Pairs:"]+ps
+            manifest=["OKX 5m CSV candle export",f"From: {from_date}",f"To: {to_date}","Pairs:"]+ps
             z.writestr("MANIFEST.txt","\\n".join(manifest))
             count=0
             for f in data_root.rglob("*"):
