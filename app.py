@@ -101,7 +101,7 @@ def stop_price(entry_raw,entry_exec,qty,max_loss):
     den=(1-SLIP)*(1-FEE)
     return max(0.0,min(entry_raw,num/den if den>0 else 0.0))
 
-def simulate(cache,days,rsi_lo,rsi_hi,wick_tol_pct,max_loss,prev_green,hold_days,trend_mode):
+def simulate(cache,days,rsi_lo,rsi_hi,wick_tol_pct,max_loss,prev_green,hold_days,trend_mode,min_profit_pct=0.0):
     cutoff=(datetime.now(timezone.utc).date()-timedelta(days=days)).isoformat()
     candidates={}
     for inst,rows in cache.items():
@@ -136,8 +136,8 @@ def simulate(cache,days,rsi_lo,rsi_hi,wick_tol_pct,max_loss,prev_green,hold_days
                 reason=None; exit_exec=None
                 if row["l"]<=open_pos["stop_raw"]:
                     reason=f"${max_loss:g} SL"; exit_exec=open_pos["stop_raw"]*(1-SLIP)
-                elif row["c"]>open_pos["entry_raw"]:
-                    reason="EOD PROFIT"; exit_exec=row["c"]*(1-SLIP)
+                elif row["c"] >= open_pos["entry_raw"]*(1+min_profit_pct/100.0):
+                    reason=f"EOD PROFIT {min_profit_pct:g}%+"; exit_exec=row["c"]*(1-SLIP)
                 elif held>=hold_days:
                     reason=f"MAX {hold_days}D EXIT"; exit_exec=row["c"]*(1-SLIP)
                 if reason:
@@ -161,8 +161,8 @@ def simulate(cache,days,rsi_lo,rsi_hi,wick_tol_pct,max_loss,prev_green,hold_days
             row=e; reason=None; exit_exec=None
             if row["l"]<=sp:
                 reason=f"${max_loss:g} SL"; exit_exec=sp*(1-SLIP)
-            elif row["c"]>entry_raw:
-                reason="EOD PROFIT"; exit_exec=row["c"]*(1-SLIP)
+            elif row["c"] >= entry_raw*(1+min_profit_pct/100.0):
+                reason=f"EOD PROFIT {min_profit_pct:g}%+"; exit_exec=row["c"]*(1-SLIP)
             if reason:
                 net=qty*(exit_exec-entry_exec)-FEE*qty*entry_exec-FEE*qty*exit_exec
                 equity+=net
@@ -176,7 +176,7 @@ def simulate(cache,days,rsi_lo,rsi_hi,wick_tol_pct,max_loss,prev_green,hold_days
         "trades":len(trades),"wins":wins,"win_rate":wins/len(trades)*100 if trades else 0,
         "net_pnl":equity-START_CAPITAL,"end_balance":equity,"max_dd":maxdd,
         "sl_hits":sum(1 for t in trades if "SL" in t["reason"]),
-        "profit_exits":sum(1 for t in trades if t["reason"]=="EOD PROFIT")
+        "profit_exits":sum(1 for t in trades if str(t["reason"]).startswith("EOD PROFIT"))
     }
 
 def run_test(days):
@@ -194,15 +194,18 @@ def run_test(days):
             except Exception:
                 pass
 
-        # Locked winner from the 180-day fine-tune CSV.
-        # Validate this exact setup only — no re-optimization.
+        # 365D PROFIT IMPROVEMENT TEST
+        # Signal is LOCKED from validated winner:
+        # EMA20+EMA50 | RSI 52-62 | Wick 0.10% | Previous Green = Yes.
+        # Only risk/exit management changes.
         rsi_ranges=[(52,62)]
         wick_tols=[0.10]
-        max_losses=[2.0]
+        max_losses=[2.0,2.5,3.0,3.5,4.0]
         prev_opts=[True]
-        hold_days_list=[1]
+        hold_days_list=[1,2,3]
         trend_modes=["EMA20+EMA50"]
-        total=1
+        min_profit_pcts=[0.0,0.25,0.50,0.75]
+        total=len(max_losses)*len(hold_days_list)*len(min_profit_pcts)
         results=[]; n=0
 
         for rr in rsi_ranges:
@@ -211,15 +214,21 @@ def run_test(days):
                     for pg in prev_opts:
                         for hd in hold_days_list:
                             for tm in trend_modes:
-                                n+=1
-                                with lock: state["test"]["progress"]=f"Validating winner {n}/{total}"
-                                r=simulate(cache,days,rr[0],rr[1],wt,ml,pg,hd,tm)
-                                r.update({"rsi":f"{rr[0]}-{rr[1]}","wick_tol":wt,"max_loss":ml,"prev_green":pg,"hold_days":hd,"trend":tm})
-                                results.append(r)
+                                for mp in min_profit_pcts:
+                                    n+=1
+                                    with lock:
+                                        state["test"]["progress"]=f"Testing profit variant {n}/{total}"
+                                    r=simulate(cache,days,rr[0],rr[1],wt,ml,pg,hd,tm,mp)
+                                    r.update({
+                                        "rsi":f"{rr[0]}-{rr[1]}","wick_tol":wt,
+                                        "max_loss":ml,"prev_green":pg,"hold_days":hd,
+                                        "trend":tm,"min_profit_pct":mp
+                                    })
+                                    results.append(r)
 
         # Stability score: prefer profit with lower drawdown and enough trades.
         for x in results:
-            x["score"] = x["net_pnl"] - 1.5*x["max_dd"] + min(x["trades"],30)*0.20
+            x["score"] = x["net_pnl"] - 2.0*x["max_dd"] + min(x["trades"],40)*0.15
         results.sort(key=lambda x:(x["trades"]>=3,x["score"],x["net_pnl"],-x["max_dd"]),reverse=True)
 
         with lock:
@@ -229,7 +238,7 @@ def run_test(days):
                 "result":{
                     "days":days,"pairs_found":len(coins),"pairs_loaded":len(cache),
                     "variants":total,"profitable":sum(1 for x in results if x["net_pnl"]>0),
-                    "top":sorted(results,key=lambda x: trend_modes.index(x["trend"]))
+                    "top":results[:30]
                 }
             })
     except Exception as e:
@@ -263,7 +272,7 @@ def status():
     with lock:return jsonify(state["test"])
 
 HTML=r"""<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Winner Strategy — 365D Validation</title><style>
+<title>365D Profit Improvement Test</title><style>
 body{margin:0;background:#071019;color:#eef6ff;font-family:Arial;padding:14px}.w{max-width:1100px;margin:auto}
 .c{background:#111d29;border:1px solid #27394b;border-radius:14px;padding:16px;margin-bottom:12px}.sub{color:#a8bacb;line-height:1.5}
 input{width:120px;padding:11px;border-radius:8px;border:1px solid #3b4d60;background:#09141e;color:white;font-size:17px}
@@ -271,12 +280,12 @@ button{padding:12px 18px;border:0;border-radius:9px;background:#387df3;color:whi
 table{width:100%;border-collapse:collapse}th,td{padding:9px;border-bottom:1px solid #253645;text-align:right;white-space:nowrap}
 th:first-child,td:first-child{text-align:left}.scroll{overflow:auto}.g{color:#6ff0a0}.r{color:#ff9999}
 </style></head><body><div class=w>
-<div class=c><h2>Winner Strategy — 365D Validation</h2>
-<div class=sub>180-day winner LOCKED hai: EMA20+EMA50, RSI 52–62, Wick Tol 0.10%, SL $2, Previous candle Green = Yes, Max Hold = 1 day. Ab isi exact setup ko 365 days par validate karega — koi re-optimization nahi hogi. Sab OKX USDT pairs scan honge.</div></div>
+<div class=c><h2>365D Winner — Profit Improvement Test</h2>
+<div class=sub>Signal rules LOCKED hain: EMA20+EMA50, RSI 52–62, Wick 0.10%, Previous Green = Yes. Ab sirf profit/risk management test hoga: SL $2–$4, Hold 1–3 days aur minimum EOD profit 0–0.75%. Sab OKX USDT pairs scan honge.</div></div>
 <div class=c><b>Backtest Days</b><br><br><input id=days type=number value=365 min=10 max=365>
-<button onclick=run()>Run 365D Winner Validation</button> <button id=dl onclick="location.href='/api/download'" style="background:#18a66a">Download 365D Full Result CSV</button><div id=msg class=sub style="margin-top:12px"></div><div id=info class=sub></div></div>
-<div class="c scroll"><h3>365D Validation Result</h3><table><thead><tr>
-<th>#</th><th>Trend Filter</th><th>RSI</th><th>Wick Tol</th><th>SL</th><th>Prev Green</th><th>Max Hold</th><th>Trades</th><th>WR</th><th>EOD Profit</th><th>SL Hits</th><th>Net P/L</th><th>End</th><th>Max DD</th><th>Score</th>
+<button onclick=run()>Run 365D Profit Test</button> <button id=dl onclick="location.href='/api/download'" style="background:#18a66a">Download Full Profit-Test CSV</button><div id=msg class=sub style="margin-top:12px"></div><div id=info class=sub></div></div>
+<div class="c scroll"><h3>Top Profit/Risk Variants</h3><table><thead><tr>
+<th>#</th><th>Trend Filter</th><th>RSI</th><th>Wick Tol</th><th>SL</th><th>Prev Green</th><th>Max Hold</th><th>Min EOD Profit</th><th>Trades</th><th>WR</th><th>EOD Profit</th><th>SL Hits</th><th>Net P/L</th><th>End</th><th>Max DD</th><th>Score</th>
 </tr></thead><tbody id=tb></tbody></table></div>
 </div><script>
 const f=(x,n=2)=>Number(x||0).toFixed(n);
@@ -287,7 +296,7 @@ async function load(){
    info.textContent=`Pairs: ${j.result.pairs_loaded}/${j.result.pairs_found} | Variants: ${j.result.variants} | Profitable: ${j.result.profitable}`;
    tb.innerHTML='';
    (j.result.top||[]).forEach((x,i)=>tb.innerHTML+=`<tr>
-   <td>${i+1}</td><td>${x.trend}</td><td>${x.rsi}</td><td>${f(x.wick_tol,2)}%</td><td>$${f(x.max_loss,0)}</td><td>${x.prev_green?'Yes':'No'}</td><td>${x.hold_days}d</td>
+   <td>${i+1}</td><td>${x.trend}</td><td>${x.rsi}</td><td>${f(x.wick_tol,2)}%</td><td>$${f(x.max_loss,0)}</td><td>${x.prev_green?'Yes':'No'}</td><td>${x.hold_days}d</td><td>${f(x.min_profit_pct,2)}%</td>
    <td>${x.trades}</td><td>${f(x.win_rate,1)}%</td><td>${x.profit_exits}</td><td>${x.sl_hits}</td>
    <td class="${x.net_pnl>=0?'g':'r'}">$${f(x.net_pnl)}</td><td>$${f(x.end_balance)}</td><td>${f(x.max_dd,1)}%</td><td>${f(x.score,1)}</td></tr>`);
  }
