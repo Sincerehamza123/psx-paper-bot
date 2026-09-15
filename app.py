@@ -183,7 +183,7 @@ def run_test(days):
     with lock:
         state["test"]={"running":True,"progress":"Starting...","result":None,"error":None,"last_run":None}
     try:
-        days=max(10,min(int(days),180))
+        days=max(10,min(int(days),365))
         coins=get_all_usdt_spot_pairs()
         cache={}
         for idx,inst in enumerate(coins,1):
@@ -194,16 +194,15 @@ def run_test(days):
             except Exception:
                 pass
 
-        # Focused variants around user's current strategy.
-        # FAST FINE-TUNE grid around the strongest profitable zone.
-        # 120 focused variants, still scanning ALL OKX USDT pairs.
-        rsi_ranges=[(49,60),(49,61),(49,62),(50,60),(50,61),(50,62),(51,60),(51,61),(51,62),(52,61),(52,62),(52,63)]
-        wick_tols=[0.00,0.05,0.10,0.15]
-        max_losses=[2.0,3.0,4.0,5.0]
+        # Locked winner from the 180-day fine-tune CSV.
+        # Validate this exact setup only — no re-optimization.
+        rsi_ranges=[(52,62)]
+        wick_tols=[0.10]
+        max_losses=[2.0]
         prev_opts=[True]
         hold_days_list=[1]
         trend_modes=["EMA20+EMA50"]
-        total=len(rsi_ranges)*len(wick_tols)*len(max_losses)*len(prev_opts)*len(hold_days_list)*len(trend_modes)
+        total=1
         results=[]; n=0
 
         for rr in rsi_ranges:
@@ -213,7 +212,7 @@ def run_test(days):
                         for hd in hold_days_list:
                             for tm in trend_modes:
                                 n+=1
-                                with lock: state["test"]["progress"]=f"Testing {tm} {n}/{total}"
+                                with lock: state["test"]["progress"]=f"Validating winner {n}/{total}"
                                 r=simulate(cache,days,rr[0],rr[1],wt,ml,pg,hd,tm)
                                 r.update({"rsi":f"{rr[0]}-{rr[1]}","wick_tol":wt,"max_loss":ml,"prev_green":pg,"hold_days":hd,"trend":tm})
                                 results.append(r)
@@ -256,7 +255,7 @@ def download_results():
     w.writerow(["Rank","Trend Filter","RSI","Wick Tol %","SL $","Prev Green","Max Hold Days","Trades","Wins","Win Rate %","EOD Profit","SL Hits","Net P/L $","End Balance $","Max DD %","Score"])
     for i,x in enumerate(result.get("top",[]),1):
         w.writerow([i,x.get("trend"),x.get("rsi"),x.get("wick_tol"),x.get("max_loss"),"Yes" if x.get("prev_green") else "No",x.get("hold_days"),x.get("trades"),x.get("wins"),round(x.get("win_rate",0),2),x.get("profit_exits"),x.get("sl_hits"),round(x.get("net_pnl",0),4),round(x.get("end_balance",0),4),round(x.get("max_dd",0),2),round(x.get("score",0),2)])
-    name=f"fine_tune_{result.get('days',180)}days_full_results.csv"
+    name=f"winner_validation_{result.get('days',365)}days_full_results.csv"
     return Response(out.getvalue(),mimetype="text/csv",headers={"Content-Disposition":f"attachment; filename={name}"})
 
 @app.get("/api/status")
@@ -264,7 +263,7 @@ def status():
     with lock:return jsonify(state["test"])
 
 HTML=r"""<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>EMA20+EMA50 Fine Tune</title><style>
+<title>Winner Strategy — 365D Validation</title><style>
 body{margin:0;background:#071019;color:#eef6ff;font-family:Arial;padding:14px}.w{max-width:1100px;margin:auto}
 .c{background:#111d29;border:1px solid #27394b;border-radius:14px;padding:16px;margin-bottom:12px}.sub{color:#a8bacb;line-height:1.5}
 input{width:120px;padding:11px;border-radius:8px;border:1px solid #3b4d60;background:#09141e;color:white;font-size:17px}
@@ -272,11 +271,11 @@ button{padding:12px 18px;border:0;border-radius:9px;background:#387df3;color:whi
 table{width:100%;border-collapse:collapse}th,td{padding:9px;border-bottom:1px solid #253645;text-align:right;white-space:nowrap}
 th:first-child,td:first-child{text-align:left}.scroll{overflow:auto}.g{color:#6ff0a0}.r{color:#ff9999}
 </style></head><body><div class=w>
-<div class=c><h2>EMA20+EMA50 — 180D Fine Tune</h2>
-<div class=sub>EMA20+EMA50 trend filter fixed hai. Ab RSI, Wick Tol aur SL ko fine-tune karega. Previous candle Green = Yes aur Max Hold = 1 day fixed hain. Sab OKX USDT pairs scan honge.</div></div>
-<div class=c><b>Backtest Days</b><br><br><input id=days type=number value=180 min=10 max=180>
-<button onclick=run()>Run 180D Fine-Tune</button> <button id=dl onclick="location.href='/api/download'" style="background:#18a66a">Download Full Result CSV</button><div id=msg class=sub style="margin-top:12px"></div><div id=info class=sub></div></div>
-<div class="c scroll"><h3>Winner Result</h3><table><thead><tr>
+<div class=c><h2>Winner Strategy — 365D Validation</h2>
+<div class=sub>180-day winner LOCKED hai: EMA20+EMA50, RSI 52–62, Wick Tol 0.10%, SL $2, Previous candle Green = Yes, Max Hold = 1 day. Ab isi exact setup ko 365 days par validate karega — koi re-optimization nahi hogi. Sab OKX USDT pairs scan honge.</div></div>
+<div class=c><b>Backtest Days</b><br><br><input id=days type=number value=365 min=10 max=365>
+<button onclick=run()>Run 365D Winner Validation</button> <button id=dl onclick="location.href='/api/download'" style="background:#18a66a">Download 365D Full Result CSV</button><div id=msg class=sub style="margin-top:12px"></div><div id=info class=sub></div></div>
+<div class="c scroll"><h3>365D Validation Result</h3><table><thead><tr>
 <th>#</th><th>Trend Filter</th><th>RSI</th><th>Wick Tol</th><th>SL</th><th>Prev Green</th><th>Max Hold</th><th>Trades</th><th>WR</th><th>EOD Profit</th><th>SL Hits</th><th>Net P/L</th><th>End</th><th>Max DD</th><th>Score</th>
 </tr></thead><tbody id=tb></tbody></table></div>
 </div><script>
@@ -293,7 +292,7 @@ async function load(){
    <td class="${x.net_pnl>=0?'g':'r'}">$${f(x.net_pnl)}</td><td>$${f(x.end_balance)}</td><td>${f(x.max_dd,1)}%</td><td>${f(x.score,1)}</td></tr>`);
  }
 }
-async function run(){msg.textContent='Starting...';await fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({days:parseInt(days.value||180)})});setTimeout(load,1000)}
+async function run(){msg.textContent='Starting...';await fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({days:parseInt(days.value||365)})});setTimeout(load,1000)}
 load();setInterval(load,8000);
 </script></body></html>"""
 
