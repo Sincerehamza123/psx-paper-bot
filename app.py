@@ -73,11 +73,25 @@ def rsi_series(closes,n=14):
         out[i]=100.0 if al==0 else 100-100/(1+ag/al)
     return out
 
+def ema_series(values,n):
+    out=[None]*len(values)
+    if len(values)<n:return out
+    seed=sum(values[:n])/n
+    out[n-1]=seed
+    k=2/(n+1)
+    e=seed
+    for i in range(n,len(values)):
+        e=values[i]*k+e*(1-k)
+        out[i]=e
+    return out
+
 def prep(inst,bars):
-    rs=rsi_series([x["c"] for x in bars],RSI_LEN)
+    closes=[x["c"] for x in bars]
+    rs=rsi_series(closes,RSI_LEN)
+    e20=ema_series(closes,20); e50=ema_series(closes,50)
     out=[]
     for i,b in enumerate(bars):
-        out.append({**b,"coin":inst,"day":datetime.fromtimestamp(b["ts"]/1000,tz=timezone.utc).date().isoformat(),"rsi":rs[i]})
+        out.append({**b,"coin":inst,"day":datetime.fromtimestamp(b["ts"]/1000,tz=timezone.utc).date().isoformat(),"rsi":rs[i],"ema20":e20[i],"ema50":e50[i]})
     return out
 
 def stop_price(entry_raw,entry_exec,qty,max_loss):
@@ -87,7 +101,7 @@ def stop_price(entry_raw,entry_exec,qty,max_loss):
     den=(1-SLIP)*(1-FEE)
     return max(0.0,min(entry_raw,num/den if den>0 else 0.0))
 
-def simulate(cache,days,rsi_lo,rsi_hi,wick_tol_pct,max_loss,prev_green,hold_days):
+def simulate(cache,days,rsi_lo,rsi_hi,wick_tol_pct,max_loss,prev_green,hold_days,trend_mode):
     cutoff=(datetime.now(timezone.utc).date()-timedelta(days=days)).isoformat()
     candidates={}
     for inst,rows in cache.items():
@@ -99,6 +113,13 @@ def simulate(cache,days,rsi_lo,rsi_hi,wick_tol_pct,max_loss,prev_green,hold_days
             # wick tolerance: low can be at most X% below open
             if s["l"] < s["o"]*(1-wick_tol_pct/100.0): continue
             if not (rsi_lo < s["rsi"] < rsi_hi): continue
+            # Trend filter uses SIGNAL day only (no future data).
+            if trend_mode=="EMA20":
+                if s.get("ema20") is None or prev.get("ema20") is None: continue
+                if not (s["c"]>s["ema20"] and s["ema20"]>prev["ema20"]): continue
+            elif trend_mode=="EMA20+EMA50":
+                if s.get("ema20") is None or s.get("ema50") is None or prev.get("ema20") is None: continue
+                if not (s["c"]>s["ema20"]>s["ema50"] and s["ema20"]>prev["ema20"]): continue
             score=(s["c"]-s["o"])/s["o"]*100 + (s["rsi"]-rsi_lo)/max(1,(rsi_hi-rsi_lo))
             candidates.setdefault(nxt["day"],[]).append({"coin":inst,"signal":s,"entry_row":nxt,"score":score})
 
@@ -181,7 +202,8 @@ def run_test(days):
         max_losses=[3.0]
         prev_opts=[True]
         hold_days_list=[1]
-        total=len(rsi_ranges)*len(wick_tols)*len(max_losses)*len(prev_opts)*len(hold_days_list)
+        trend_modes=["NONE","EMA20","EMA20+EMA50"]
+        total=len(rsi_ranges)*len(wick_tols)*len(max_losses)*len(prev_opts)*len(hold_days_list)*len(trend_modes)
         results=[]; n=0
 
         for rr in rsi_ranges:
@@ -189,11 +211,12 @@ def run_test(days):
                 for ml in max_losses:
                     for pg in prev_opts:
                         for hd in hold_days_list:
-                            n+=1
-                            with lock: state["test"]["progress"]=f"Testing variant {n}/{total}"
-                            r=simulate(cache,days,rr[0],rr[1],wt,ml,pg,hd)
-                            r.update({"rsi":f"{rr[0]}-{rr[1]}","wick_tol":wt,"max_loss":ml,"prev_green":pg,"hold_days":hd})
-                            results.append(r)
+                            for tm in trend_modes:
+                                n+=1
+                                with lock: state["test"]["progress"]=f"Testing {tm} {n}/{total}"
+                                r=simulate(cache,days,rr[0],rr[1],wt,ml,pg,hd,tm)
+                                r.update({"rsi":f"{rr[0]}-{rr[1]}","wick_tol":wt,"max_loss":ml,"prev_green":pg,"hold_days":hd,"trend":tm})
+                                results.append(r)
 
         # Stability score: prefer profit with lower drawdown and enough trades.
         for x in results:
@@ -207,7 +230,7 @@ def run_test(days):
                 "result":{
                     "days":days,"pairs_found":len(coins),"pairs_loaded":len(cache),
                     "variants":total,"profitable":sum(1 for x in results if x["net_pnl"]>0),
-                    "top":results[:1]
+                    "top":sorted(results,key=lambda x: trend_modes.index(x["trend"]))
                 }
             })
     except Exception as e:
@@ -227,7 +250,7 @@ def status():
     with lock:return jsonify(state["test"])
 
 HTML=r"""<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Strategy Variant Tester</title><style>
+<title>Winner Trend Filter Comparison</title><style>
 body{margin:0;background:#071019;color:#eef6ff;font-family:Arial;padding:14px}.w{max-width:1100px;margin:auto}
 .c{background:#111d29;border:1px solid #27394b;border-radius:14px;padding:16px;margin-bottom:12px}.sub{color:#a8bacb;line-height:1.5}
 input{width:120px;padding:11px;border-radius:8px;border:1px solid #3b4d60;background:#09141e;color:white;font-size:17px}
@@ -235,12 +258,12 @@ button{padding:12px 18px;border:0;border-radius:9px;background:#387df3;color:whi
 table{width:100%;border-collapse:collapse}th,td{padding:9px;border-bottom:1px solid #253645;text-align:right;white-space:nowrap}
 th:first-child,td:first-child{text-align:left}.scroll{overflow:auto}.g{color:#6ff0a0}.r{color:#ff9999}
 </style></head><body><div class=w>
-<div class=c><h2>Winner Strategy — Validation</h2>
-<div class=sub>Winner validation: #1 setup fixed hai — RSI 51–62, Wick Tol 0.05%, SL $3, Previous candle Green = Yes, Max Hold = 1 day. Sab OKX USDT pairs scan honge. Backtest days change karke isi exact setup ko validate karein.</div></div>
-<div class=c><b>Backtest Days</b><br><br><input id=days type=number value=60 min=10 max=180>
-<button onclick=run()>Run Winner Backtest</button><div id=msg class=sub style="margin-top:12px"></div><div id=info class=sub></div></div>
+<div class=c><h2>Winner Strategy — Trend Filter Comparison</h2>
+<div class=sub>Exact winner rules fixed hain: RSI 51–62, Wick Tol 0.05%, SL $3, Previous candle Green = Yes, Max Hold = 1 day. Sirf trend filter compare hoga: No Filter vs EMA20 vs EMA20+EMA50. Sab OKX USDT pairs scan honge.</div></div>
+<div class=c><b>Backtest Days</b><br><br><input id=days type=number value=180 min=10 max=180>
+<button onclick=run()>Compare 3 Trend Filters</button><div id=msg class=sub style="margin-top:12px"></div><div id=info class=sub></div></div>
 <div class="c scroll"><h3>Winner Result</h3><table><thead><tr>
-<th>#</th><th>RSI</th><th>Wick Tol</th><th>SL</th><th>Prev Green</th><th>Max Hold</th><th>Trades</th><th>WR</th><th>EOD Profit</th><th>SL Hits</th><th>Net P/L</th><th>End</th><th>Max DD</th><th>Score</th>
+<th>#</th><th>Trend Filter</th><th>RSI</th><th>Wick Tol</th><th>SL</th><th>Prev Green</th><th>Max Hold</th><th>Trades</th><th>WR</th><th>EOD Profit</th><th>SL Hits</th><th>Net P/L</th><th>End</th><th>Max DD</th><th>Score</th>
 </tr></thead><tbody id=tb></tbody></table></div>
 </div><script>
 const f=(x,n=2)=>Number(x||0).toFixed(n);
@@ -251,12 +274,12 @@ async function load(){
    info.textContent=`Pairs: ${j.result.pairs_loaded}/${j.result.pairs_found} | Variants: ${j.result.variants} | Profitable: ${j.result.profitable}`;
    tb.innerHTML='';
    (j.result.top||[]).forEach((x,i)=>tb.innerHTML+=`<tr>
-   <td>${i+1}</td><td>${x.rsi}</td><td>${f(x.wick_tol,2)}%</td><td>$${f(x.max_loss,0)}</td><td>${x.prev_green?'Yes':'No'}</td><td>${x.hold_days}d</td>
+   <td>${i+1}</td><td>${x.trend}</td><td>${x.rsi}</td><td>${f(x.wick_tol,2)}%</td><td>$${f(x.max_loss,0)}</td><td>${x.prev_green?'Yes':'No'}</td><td>${x.hold_days}d</td>
    <td>${x.trades}</td><td>${f(x.win_rate,1)}%</td><td>${x.profit_exits}</td><td>${x.sl_hits}</td>
    <td class="${x.net_pnl>=0?'g':'r'}">$${f(x.net_pnl)}</td><td>$${f(x.end_balance)}</td><td>${f(x.max_dd,1)}%</td><td>${f(x.score,1)}</td></tr>`);
  }
 }
-async function run(){msg.textContent='Starting...';await fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({days:parseInt(days.value||60)})});setTimeout(load,1000)}
+async function run(){msg.textContent='Starting...';await fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({days:parseInt(days.value||180)})});setTimeout(load,1000)}
 load();setInterval(load,8000);
 </script></body></html>"""
 
