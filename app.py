@@ -7,12 +7,12 @@ from datetime import datetime,timedelta,timezone
 BASE=Path("/app"); UD=BASE/"user_data"; STRAT=UD/"strategies"/"GeneticEngineV1.py"; CONFIG=UD/"config.json"; RESULT=UD/"backtest_results"
 STATE={"running":False,"status":"Ready","progress":0,"error":"","summary":None,"report":None}; LOCK=threading.Lock()
 
-HTML="""<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>GeneticEngineV1 365D</title>
+HTML="""<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>GeneticEngineV1 Date Range</title>
 <style>body{font-family:Arial;background:#0b1220;color:#e8eef9;padding:18px}.card{max-width:800px;margin:auto;background:#121c2e;padding:20px;border-radius:16px}button{background:#2878ed;color:white;border:0;padding:14px 18px;border-radius:10px;font-weight:bold}.bar{height:12px;background:#26344b;border-radius:8px;overflow:hidden}.fill{height:100%;background:#2878ed}.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.box{background:#0c1525;padding:12px;border-radius:10px}.muted{color:#9db0cb}a{color:#7fb1ff}pre{white-space:pre-wrap}</style></head>
-<body><div class="card"><h1>GeneticEngineV1 - 365D Backtest</h1><p class="muted">Original GitHub strategy | 5m | OKX Spot | $100 start | Max 5 open trades | Top 20 USDT pairs</p>
-<button id="run" onclick="go()">Run 365 Days</button><p id="st">Ready</p><div class="bar"><div id="fill" class="fill" style="width:0%"></div></div><div id="sum"></div>
+<body><div class="card"><h1>GeneticEngineV1 - Date Range Backtest</h1><p class="muted">Original GitHub strategy | 5m | OKX Spot | $100 start | Max 5 open trades | Top 20 USDT pairs | Select any From/To date range</p>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:14px 0"><label>From Date<br><input id="fromdate" type="date" style="width:100%;padding:10px;margin-top:5px"></label><label>To Date<br><input id="todate" type="date" style="width:100%;padding:10px;margin-top:5px"></label></div><button id="run" onclick="go()">Run Date Range</button><p id="st">Ready</p><div class="bar"><div id="fill" class="fill" style="width:0%"></div></div><div id="sum"></div>
 <p><a id="dl" href="/download" style="display:none">Download Trade-wise CSV</a></p><pre id="err"></pre></div>
-<script>async function go(){run.disabled=true;await fetch('/run',{method:'POST'});poll()}async function poll(){let x=await(await fetch('/status')).json();st.textContent=x.status;fill.style.width=x.progress+'%';if(x.summary){let s=x.summary;sum.innerHTML='<div class="grid"><div class="box"><b>Trades</b><br>'+s.trades+'</div><div class="box"><b>Net P/L</b><br>$'+s.profit_abs+'</div><div class="box"><b>End Balance</b><br>$'+s.end_balance+'</div><div class="box"><b>Win Rate</b><br>'+s.win_rate+'%</div><div class="box"><b>Max DD</b><br>'+s.max_dd+'%</div><div class="box"><b>Pairs</b><br>'+s.pairs+'</div></div>';dl.style.display='inline'}if(x.error)err.textContent=x.error;if(x.running)setTimeout(poll,2500);else run.disabled=false}poll()</script></body></html>"""
+<script>async function go(){if(!fromdate.value||!todate.value){alert('From aur To date select karein');return}if(fromdate.value>todate.value){alert('From Date, To Date se pehle honi chahiye');return}run.disabled=true;await fetch('/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({from:fromdate.value,to:todate.value})});poll()}async function poll(){let x=await(await fetch('/status')).json();st.textContent=x.status;fill.style.width=x.progress+'%';if(x.summary){let s=x.summary;sum.innerHTML='<div class="grid"><div class="box"><b>Trades</b><br>'+s.trades+'</div><div class="box"><b>Net P/L</b><br>$'+s.profit_abs+'</div><div class="box"><b>End Balance</b><br>$'+s.end_balance+'</div><div class="box"><b>Win Rate</b><br>'+s.win_rate+'%</div><div class="box"><b>Max DD</b><br>'+s.max_dd+'%</div><div class="box"><b>Pairs</b><br>'+s.pairs+'</div></div>';dl.style.display='inline'}if(x.error)err.textContent=x.error;if(x.running)setTimeout(poll,2500);else run.disabled=false}poll()</script></body></html>"""
 
 def cmd(a,timeout=7200):
     p=subprocess.run(a,cwd=BASE,text=True,capture_output=True,timeout=timeout)
@@ -51,10 +51,15 @@ def parse(path,ps):
         for i,t in enumerate(ts,1): w.writerow([i,t.get("pair"),t.get("open_date"),t.get("close_date"),t.get("open_rate"),t.get("close_rate"),round(float(t.get("profit_abs",0) or 0),6),round(float(t.get("profit_ratio",0) or 0)*100,4),t.get("exit_reason")])
     return {"trades":len(ts),"profit_abs":round(profit,2),"end_balance":round(100+profit,2),"win_rate":round(100*wins/len(ts),2) if ts else 0,"max_dd":round(dd,2),"pairs":len(ps)},str(rp)
 
-def work():
+def work(from_date,to_date):
     try:
         with LOCK: STATE.update(running=True,status="Finding top 20 OKX pairs...",progress=5,error="",summary=None,report=None)
-        ps=pairs(); config(ps); end=datetime.now(timezone.utc).date(); start=end-timedelta(days=365); tr=f"{start:%Y%m%d}-{end:%Y%m%d}"
+        ps=pairs(); config(ps)
+        start=datetime.strptime(from_date,"%Y-%m-%d").date()
+        end=datetime.strptime(to_date,"%Y-%m-%d").date()
+        if start>end: raise RuntimeError("From Date must be before To Date.")
+        if end>datetime.now(timezone.utc).date(): raise RuntimeError("To Date future mein nahi ho sakti.")
+        tr=f"{start:%Y%m%d}-{end:%Y%m%d}"
         with LOCK: STATE.update(status="Downloading 5m candles...",progress=15)
         cmd(["freqtrade","download-data","--config",str(CONFIG),"--timeframes","5m","--timerange",tr])
         with LOCK: STATE.update(status="Running GeneticEngineV1...",progress=55)
@@ -84,9 +89,18 @@ class H(BaseHTTPRequestHandler):
         self.sendx(b"Not found","text/plain",404)
     def do_POST(self):
         if self.path=="/run":
-            with LOCK:
-                if not STATE["running"]: STATE["running"]=True; threading.Thread(target=work,daemon=True).start()
-            return self.sendx(b'{"ok":true}',"application/json")
+            try:
+                n=int(self.headers.get("Content-Length","0") or 0)
+                data=json.loads(self.rfile.read(n) or b"{}")
+                fd=data.get("from"); td=data.get("to")
+                if not fd or not td: return self.sendx(b'{"ok":false,"error":"Dates required"}',"application/json",400)
+                with LOCK:
+                    if not STATE["running"]:
+                        STATE["running"]=True
+                        threading.Thread(target=work,args=(fd,td),daemon=True).start()
+                return self.sendx(b'{"ok":true}',"application/json")
+            except Exception as e:
+                return self.sendx(json.dumps({"ok":False,"error":str(e)}).encode(),"application/json",400)
         self.sendx(b"Not found","text/plain",404)
     def log_message(self,*a): pass
 
