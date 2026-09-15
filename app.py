@@ -151,7 +151,12 @@ def simulate(cache,days,rsi_lo,rsi_hi,wick_tol_pct,max_loss,prev_green,hold_days
 
         if open_pos is None and equity>0 and day in candidates:
             pick=sorted(candidates[day],key=lambda x:x["score"],reverse=True)[0]
-            e=pick["entry_row"]; entry_raw=e["o"]; entry_exec=entry_raw*(1+SLIP)
+            e=pick["entry_row"]
+            entry_raw=e["o"]*(1-pullback_pct/100.0)
+            # Limit-style pullback entry: no fill unless next-day LOW touches the requested price.
+            if e["l"] > entry_raw:
+                continue
+            entry_exec=entry_raw*(1+SLIP)
             notional=min(START_CAPITAL*LEVERAGE,equity*LEVERAGE)
             qty=notional/entry_exec
             sp=stop_price(entry_raw,entry_exec,qty,max_loss)
@@ -258,10 +263,10 @@ def download_results():
         return Response("Pehle backtest complete karein.",status=400,mimetype="text/plain")
     out=io.StringIO()
     w=csv.writer(out)
-    w.writerow(["Rank","Trend Filter","RSI","Wick Tol %","SL $","Prev Green","Max Hold Days","Min EOD Profit %","Trades","Wins","Win Rate %","EOD Profit","SL Hits","Net P/L $","End Balance $","Max DD %","Score"])
+    w.writerow(["Rank","Trend Filter","RSI","Wick Tol %","SL $","Prev Green","Max Hold Days","Min EOD Profit %","Entry Pullback %","Trades","Wins","Win Rate %","EOD Profit","SL Hits","Net P/L $","End Balance $","Max DD %","Score"])
     for i,x in enumerate(result.get("top",[]),1):
-        w.writerow([i,x.get("trend"),x.get("rsi"),x.get("wick_tol"),x.get("max_loss"),"Yes" if x.get("prev_green") else "No",x.get("hold_days"),x.get("min_profit_pct",0),x.get("trades"),x.get("wins"),round(x.get("win_rate",0),2),x.get("profit_exits"),x.get("sl_hits"),round(x.get("net_pnl",0),4),round(x.get("end_balance",0),4),round(x.get("max_dd",0),2),round(x.get("score",0),2)])
-    name=f"winner_validation_{result.get('days',365)}days_full_results.csv"
+        w.writerow([i,x.get("trend"),x.get("rsi"),x.get("wick_tol"),x.get("max_loss"),"Yes" if x.get("prev_green") else "No",x.get("hold_days"),x.get("min_profit_pct",0),x.get("pullback_pct",0),x.get("trades"),x.get("wins"),round(x.get("win_rate",0),2),x.get("profit_exits"),x.get("sl_hits"),round(x.get("net_pnl",0),4),round(x.get("end_balance",0),4),round(x.get("max_dd",0),2),round(x.get("score",0),2)])
+    name=f"pullback_entry_test_{result.get('days',365)}days_results.csv"
     return Response(out.getvalue(),mimetype="text/csv",headers={"Content-Disposition":f"attachment; filename={name}"})
 
 @app.get("/api/status")
@@ -269,7 +274,7 @@ def status():
     with lock:return jsonify(state["test"])
 
 HTML=r"""<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>365D Profit Improvement Test</title><style>
+<title>HAMZA PULLBACK ENTRY TEST V2</title><style>
 body{margin:0;background:#071019;color:#eef6ff;font-family:Arial;padding:14px}.w{max-width:1100px;margin:auto}
 .c{background:#111d29;border:1px solid #27394b;border-radius:14px;padding:16px;margin-bottom:12px}.sub{color:#a8bacb;line-height:1.5}
 input{width:120px;padding:11px;border-radius:8px;border:1px solid #3b4d60;background:#09141e;color:white;font-size:17px}
@@ -277,12 +282,12 @@ button{padding:12px 18px;border:0;border-radius:9px;background:#387df3;color:whi
 table{width:100%;border-collapse:collapse}th,td{padding:9px;border-bottom:1px solid #253645;text-align:right;white-space:nowrap}
 th:first-child,td:first-child{text-align:left}.scroll{overflow:auto}.g{color:#6ff0a0}.r{color:#ff9999}
 </style></head><body><div class=w>
-<div class=c><h2>HAMZA PULLBACK ENTRY TEST V1</h2>
+<div class=c><h2>HAMZA PULLBACK ENTRY TEST V2</h2>
 <div class=sub>Signal rules LOCKED hain: EMA20+EMA50, RSI 52–62, Wick 0.10%, Previous Green = Yes. Ab sirf profit/risk management test hoga: HAMZA Best Strategy LOCKED hai. Sirf next-day entry compare hogi: Open, ya Open se 0.25%, 0.50%, 0.75%, 1.00% neeche. Pullback trade tabhi fill hogi jab us din ka Low actual entry level ko touch kare. Future data use nahi hoga. Sab OKX USDT pairs scan honge.</div></div>
 <div class=c><b>Backtest Days</b><br><br><input id=days type=number value=365 min=10 max=365>
-<button onclick=run()>Run Pullback Entry Test</button> <button id=dl onclick="location.href='/api/download'" style="background:#18a66a">Download Pullback Entry Results</button><div id=msg class=sub style="margin-top:12px"></div><div id=info class=sub></div></div>
+<button onclick=run()>Run Pullback Entry Test V2</button> <button id=dl onclick="location.href='/api/download'" style="background:#18a66a">Download Pullback V2 Results</button><div id=msg class=sub style="margin-top:12px"></div><div id=info class=sub></div></div>
 <div class="c scroll"><h3>Pullback Entry Results</h3><table><thead><tr>
-<th>#</th><th>Trend Filter</th><th>RSI</th><th>Wick Tol</th><th>SL</th><th>Prev Green</th><th>Max Hold</th><th>Min EOD Profit</th><th>Trades</th><th>WR</th><th>EOD Profit</th><th>SL Hits</th><th>Net P/L</th><th>End</th><th>Max DD</th><th>Score</th>
+<th>#</th><th>Trend Filter</th><th>RSI</th><th>Wick Tol</th><th>SL</th><th>Prev Green</th><th>Max Hold</th><th>Min EOD Profit</th><th>Pullback %</th><th>Trades</th><th>WR</th><th>EOD Profit</th><th>SL Hits</th><th>Net P/L</th><th>End</th><th>Max DD</th><th>Score</th>
 </tr></thead><tbody id=tb></tbody></table></div>
 </div><script>
 const f=(x,n=2)=>Number(x||0).toFixed(n);
@@ -293,7 +298,7 @@ async function load(){
    info.textContent=`Pairs: ${j.result.pairs_loaded}/${j.result.pairs_found} | Variants: ${j.result.variants} | Profitable: ${j.result.profitable}`;
    tb.innerHTML='';
    (j.result.top||[]).forEach((x,i)=>tb.innerHTML+=`<tr>
-   <td>${i+1}</td><td>${x.trend}</td><td>${x.rsi}</td><td>${f(x.wick_tol,2)}%</td><td>$${f(x.max_loss,0)}</td><td>${x.prev_green?'Yes':'No'}</td><td>${x.hold_days}d</td><td>${f(x.min_profit_pct,2)}%</td>
+   <td>${i+1}</td><td>${x.trend}</td><td>${x.rsi}</td><td>${f(x.wick_tol,2)}%</td><td>$${f(x.max_loss,0)}</td><td>${x.prev_green?'Yes':'No'}</td><td>${x.hold_days}d</td><td>${f(x.min_profit_pct,2)}%</td><td>${f(x.pullback_pct,2)}%</td>
    <td>${x.trades}</td><td>${f(x.win_rate,1)}%</td><td>${x.profit_exits}</td><td>${x.sl_hits}</td>
    <td class="${x.net_pnl>=0?'g':'r'}">$${f(x.net_pnl)}</td><td>$${f(x.end_balance)}</td><td>${f(x.max_dd,1)}%</td><td>${f(x.score,1)}</td></tr>`);
  }
