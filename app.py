@@ -174,13 +174,13 @@ def run_test(days):
                 pass
 
         # Focused variants around user's current strategy.
-        # FAST focused grid around the user's latest rules.
-        # 48 variants instead of 360, while still scanning ALL OKX USDT pairs.
-        rsi_ranges=[(50,60),(50,62),(52,60)]
-        wick_tols=[0.0,0.10]
-        max_losses=[3.0,5.0,7.0,10.0]
+        # FAST FINE-TUNE grid around the strongest profitable zone.
+        # 120 focused variants, still scanning ALL OKX USDT pairs.
+        rsi_ranges=[(50,60),(50,61),(50,62),(51,60),(51,61),(51,62)]
+        wick_tols=[0.0,0.05,0.10,0.15]
+        max_losses=[3.0,4.0,5.0,6.0,7.0]
         prev_opts=[True]
-        hold_days_list=[1,2]
+        hold_days_list=[1]
         total=len(rsi_ranges)*len(wick_tols)*len(max_losses)*len(prev_opts)*len(hold_days_list)
         results=[]; n=0
 
@@ -195,8 +195,10 @@ def run_test(days):
                             r.update({"rsi":f"{rr[0]}-{rr[1]}","wick_tol":wt,"max_loss":ml,"prev_green":pg,"hold_days":hd})
                             results.append(r)
 
-        # Rank: net profit first, then lower DD, with at least 3 trades preferred.
-        results.sort(key=lambda x:(x["trades"]>=3,x["net_pnl"],-x["max_dd"]),reverse=True)
+        # Stability score: prefer profit with lower drawdown and enough trades.
+        for x in results:
+            x["score"] = x["net_pnl"] - 1.5*x["max_dd"] + min(x["trades"],30)*0.20
+        results.sort(key=lambda x:(x["trades"]>=3,x["score"],x["net_pnl"],-x["max_dd"]),reverse=True)
 
         with lock:
             state["test"].update({
@@ -233,12 +235,12 @@ button{padding:12px 18px;border:0;border-radius:9px;background:#387df3;color:whi
 table{width:100%;border-collapse:collapse}th,td{padding:9px;border-bottom:1px solid #253645;text-align:right;white-space:nowrap}
 th:first-child,td:first-child{text-align:left}.scroll{overflow:auto}.g{color:#6ff0a0}.r{color:#ff9999}
 </style></head><body><div class=w>
-<div class=c><h2>Current Strategy — FAST Variant Test</h2>
-<div class=sub>FAST test: sab OKX USDT pairs scan honge, lekin sirf 48 focused variants test honge. RSI range, lower-wick tolerance, $ stop-loss aur max hold 1–2 days compare honge. Previous candle green rule fixed rahega.</div></div>
+<div class=c><h2>Current Strategy — FAST Fine-Tune</h2>
+<div class=sub>FAST fine-tune: sab OKX USDT pairs scan honge. 120 focused variants RSI 50–62 zone, wick 0–0.15% aur $3–$7 SL ke andar test honge. Previous candle green fixed hai. Ranking profit ke saath drawdown ko bhi penalize karti hai.</div></div>
 <div class=c><b>Backtest Days</b><br><br><input id=days type=number value=60 min=10 max=180>
-<button onclick=run()>Run Fast Test</button><div id=msg class=sub style="margin-top:12px"></div><div id=info class=sub></div></div>
+<button onclick=run()>Run Fine-Tune</button><div id=msg class=sub style="margin-top:12px"></div><div id=info class=sub></div></div>
 <div class="c scroll"><h3>Top 20 Variants</h3><table><thead><tr>
-<th>#</th><th>RSI</th><th>Wick Tol</th><th>SL</th><th>Prev Green</th><th>Max Hold</th><th>Trades</th><th>WR</th><th>EOD Profit</th><th>SL Hits</th><th>Net P/L</th><th>End</th><th>Max DD</th>
+<th>#</th><th>RSI</th><th>Wick Tol</th><th>SL</th><th>Prev Green</th><th>Max Hold</th><th>Trades</th><th>WR</th><th>EOD Profit</th><th>SL Hits</th><th>Net P/L</th><th>End</th><th>Max DD</th><th>Score</th>
 </tr></thead><tbody id=tb></tbody></table></div>
 </div><script>
 const f=(x,n=2)=>Number(x||0).toFixed(n);
@@ -251,7 +253,7 @@ async function load(){
    (j.result.top||[]).forEach((x,i)=>tb.innerHTML+=`<tr>
    <td>${i+1}</td><td>${x.rsi}</td><td>${f(x.wick_tol,2)}%</td><td>$${f(x.max_loss,0)}</td><td>${x.prev_green?'Yes':'No'}</td><td>${x.hold_days}d</td>
    <td>${x.trades}</td><td>${f(x.win_rate,1)}%</td><td>${x.profit_exits}</td><td>${x.sl_hits}</td>
-   <td class="${x.net_pnl>=0?'g':'r'}">$${f(x.net_pnl)}</td><td>$${f(x.end_balance)}</td><td>${f(x.max_dd,1)}%</td></tr>`);
+   <td class="${x.net_pnl>=0?'g':'r'}">$${f(x.net_pnl)}</td><td>$${f(x.end_balance)}</td><td>${f(x.max_dd,1)}%</td><td>${f(x.score,1)}</td></tr>`);
  }
 }
 async function run(){msg.textContent='Starting...';await fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({days:parseInt(days.value||60)})});setTimeout(load,1000)}
