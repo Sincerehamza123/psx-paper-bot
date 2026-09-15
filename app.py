@@ -67,7 +67,7 @@ def work(from_date,to_date):
         if end>datetime.now(timezone.utc).date(): raise RuntimeError("To Date future mein nahi ho sakti.")
         tr=f"{start:%Y%m%d}-{end:%Y%m%d}"
         with LOCK: STATE.update(status=f"Downloading 5m candles for {len(ps)} pairs...",progress=20)
-        cmd(["freqtrade","download-data","--config",str(CONFIG),"--timeframes","5m","--timerange",tr,"--data-format-ohlcv","csv"])
+        cmd(["freqtrade","download-data","--config",str(CONFIG),"--datadir",str(UD/"data"),"--timeframes","5m","--timerange",tr,"--data-format-ohlcv","csv"])
         with LOCK: STATE.update(status="Packing candle files into ZIP...",progress=85)
 
         data_root=UD/"data"
