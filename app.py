@@ -101,7 +101,7 @@ def stop_price(entry_raw,entry_exec,qty,max_loss):
     den=(1-SLIP)*(1-FEE)
     return max(0.0,min(entry_raw,num/den if den>0 else 0.0))
 
-def simulate(cache,days,rsi_lo,rsi_hi,wick_tol_pct,max_loss,prev_green,hold_days,trend_mode,min_profit_pct=0.0,pullback_pct=0.0):
+def simulate(cache,days,rsi_lo,rsi_hi,wick_tol_pct,max_loss,prev_green,hold_days,trend_mode,min_profit_pct=0.0,strategy_mode='HAMZA'):
     cutoff=(datetime.now(timezone.utc).date()-timedelta(days=days)).isoformat()
     candidates={}
     for inst,rows in cache.items():
@@ -121,7 +121,34 @@ def simulate(cache,days,rsi_lo,rsi_hi,wick_tol_pct,max_loss,prev_green,hold_days
                 if s.get("ema20") is None or s.get("ema50") is None or prev.get("ema20") is None: continue
                 if not (s["c"]>s["ema20"]>s["ema50"] and s["ema20"]>prev["ema20"]): continue
             score=(s["c"]-s["o"])/s["o"]*100 + (s["rsi"]-rsi_lo)/max(1,(rsi_hi-rsi_lo))
-            candidates.setdefault(nxt["day"],[]).append({"coin":inst,"signal":s,"entry_row":nxt,"score":score})
+            candidates.setdefault(nxt["day"],[]).append({"coin":inst,"signal":s,"entry_row":nxt,"score":score,"strategy":"HAMZA"})
+
+    # Independent DAILY EMA50 pullback-continuation candidates.
+    ema_candidates={}
+    for inst,rows in cache.items():
+        for i in range(1,len(rows)-1):
+            prev=rows[i-1]; s=rows[i]; nxt=rows[i+1]
+            if s["day"]<cutoff or s.get("rsi") is None: continue
+            if s.get("ema20") is None or s.get("ema50") is None or prev.get("ema50") is None: continue
+            if not (s["ema20"] > s["ema50"] and s["ema50"] >= prev["ema50"]): continue
+            if not (s["c"] > s["o"] and s["c"] > s["ema50"]): continue
+            d1=abs(s["l"]-s["ema50"])/s["ema50"]*100
+            d0=abs(prev["l"]-prev["ema50"])/prev["ema50"]*100
+            if min(d1,d0) > 1.0: continue
+            if not (45 < s["rsi"] < 62): continue
+            body=(s["c"]-s["o"])/s["o"]*100
+            if body > 4.0: continue
+            score2=(1-min(d1,1.0))+body*0.25+(s["rsi"]-45)/17
+            ema_candidates.setdefault(nxt["day"],[]).append({"coin":inst,"signal":s,"entry_row":nxt,"score":score2,"strategy":"EMA50"})
+
+    if strategy_mode=="EMA50":
+        candidates=ema_candidates
+    elif strategy_mode=="COMBO":
+        merged={}
+        for d in set(candidates)|set(ema_candidates):
+            # If HAMZA has a signal that day, preserve HAMZA priority; otherwise use EMA50.
+            merged[d]=candidates.get(d,[]) or ema_candidates.get(d,[])
+        candidates=merged
 
     equity=START_CAPITAL; peak=START_CAPITAL; maxdd=0.0
     trades=[]; open_pos=None
@@ -144,23 +171,18 @@ def simulate(cache,days,rsi_lo,rsi_hi,wick_tol_pct,max_loss,prev_green,hold_days
                     q=open_pos["qty"]
                     net=q*(exit_exec-open_pos["entry_exec"])-FEE*q*open_pos["entry_exec"]-FEE*q*exit_exec
                     equity+=net
-                    trades.append({"coin":open_pos["coin"],"signal_day":open_pos["signal_day"],"entry_day":open_pos["entry_day"],"exit_day":day,"reason":reason,"net":net})
+                    trades.append({"coin":open_pos["coin"],"strategy":open_pos.get("strategy","HAMZA"),"signal_day":open_pos["signal_day"],"entry_day":open_pos["entry_day"],"exit_day":day,"reason":reason,"net":net})
                     open_pos=None
                     peak=max(peak,equity)
                     if peak>0:maxdd=max(maxdd,(peak-equity)/peak*100)
 
         if open_pos is None and equity>0 and day in candidates:
             pick=sorted(candidates[day],key=lambda x:x["score"],reverse=True)[0]
-            e=pick["entry_row"]
-            entry_raw=e["o"]*(1-pullback_pct/100.0)
-            # Limit-style pullback entry: no fill unless next-day LOW touches the requested price.
-            if e["l"] > entry_raw:
-                continue
-            entry_exec=entry_raw*(1+SLIP)
+            e=pick["entry_row"]; entry_raw=e["o"]; entry_exec=entry_raw*(1+SLIP)
             notional=min(START_CAPITAL*LEVERAGE,equity*LEVERAGE)
             qty=notional/entry_exec
             sp=stop_price(entry_raw,entry_exec,qty,max_loss)
-            open_pos={"coin":pick["coin"],"signal_day":pick["signal"]["day"],"entry_day":day,"entry_raw":entry_raw,"entry_exec":entry_exec,"qty":qty,"stop_raw":sp}
+            open_pos={"coin":pick["coin"],"strategy":pick.get("strategy","HAMZA"),"signal_day":pick["signal"]["day"],"entry_day":day,"entry_raw":entry_raw,"entry_exec":entry_exec,"qty":qty,"stop_raw":sp}
 
             # same-day exit
             row=e; reason=None; exit_exec=None
@@ -171,7 +193,7 @@ def simulate(cache,days,rsi_lo,rsi_hi,wick_tol_pct,max_loss,prev_green,hold_days
             if reason:
                 net=qty*(exit_exec-entry_exec)-FEE*qty*entry_exec-FEE*qty*exit_exec
                 equity+=net
-                trades.append({"coin":open_pos["coin"],"signal_day":open_pos["signal_day"],"entry_day":day,"exit_day":day,"reason":reason,"net":net})
+                trades.append({"coin":open_pos["coin"],"strategy":open_pos.get("strategy","HAMZA"),"signal_day":open_pos["signal_day"],"entry_day":day,"exit_day":day,"reason":reason,"net":net})
                 open_pos=None
                 peak=max(peak,equity)
                 if peak>0:maxdd=max(maxdd,(peak-equity)/peak*100)
@@ -199,30 +221,18 @@ def run_test(days):
             except Exception:
                 pass
 
-        # HAMZA BEST STRATEGY stays LOCKED.
-        rsi_lo,rsi_hi=52,63
-        wick_tol=0.05
-        max_loss=2.75
-        prev_green=True
-        hold_days=3
-        trend_mode="EMA20+EMA50"
-        min_profit_pct=0.60
-
-        # Next-day entry: OPEN baseline vs limit pullbacks below OPEN.
-        pullbacks=[0.00,0.25,0.50,0.75,1.00]
-        total=len(pullbacks)
+        # HAMZA Best remains LOCKED; compare with an independent EMA50 pullback setup.
+        modes=["HAMZA","EMA50","COMBO"]
+        total=3
         results=[]; n=0
-
-        for pb in pullbacks:
+        for mode in modes:
             n+=1
-            with lock:
-                state["test"]["progress"]=f"Testing pullback entry {n}/{total}: {pb:.2f}%"
-            r=simulate(cache,days,rsi_lo,rsi_hi,wick_tol,max_loss,prev_green,hold_days,trend_mode,min_profit_pct,pb)
-            r.update({
-                "rsi":"52-63","wick_tol":wick_tol,"max_loss":max_loss,
-                "prev_green":True,"hold_days":hold_days,"trend":trend_mode,
-                "min_profit_pct":min_profit_pct,"pullback_pct":pb
-            })
+            with lock: state["test"]["progress"]=f"Testing {mode} {n}/3"
+            r=simulate(cache,days,52,63,0.05,2.75,True,3,"EMA20+EMA50",0.60,mode)
+            r.update({"trend":mode,"rsi":"52-63" if mode=="HAMZA" else "Mixed",
+                      "wick_tol":0.05 if mode=="HAMZA" else "",
+                      "max_loss":2.75,"prev_green":True if mode=="HAMZA" else "",
+                      "hold_days":3,"min_profit_pct":0.60,"strategy_mode":mode})
             r["monthly_avg"]=r["net_pnl"]/12.0
             r["target_gap"]=r["net_pnl"]-360.0
             r["target_hit"]=r["net_pnl"]>=360.0
@@ -263,10 +273,10 @@ def download_results():
         return Response("Pehle backtest complete karein.",status=400,mimetype="text/plain")
     out=io.StringIO()
     w=csv.writer(out)
-    w.writerow(["Rank","Trend Filter","RSI","Wick Tol %","SL $","Prev Green","Max Hold Days","Min EOD Profit %","Entry Pullback %","Trades","Wins","Win Rate %","EOD Profit","SL Hits","Net P/L $","End Balance $","Max DD %","Score"])
+    w.writerow(["Rank","Trend Filter","RSI","Wick Tol %","SL $","Prev Green","Max Hold Days","Min EOD Profit %","Trades","Wins","Win Rate %","EOD Profit","SL Hits","Net P/L $","End Balance $","Max DD %","Score"])
     for i,x in enumerate(result.get("top",[]),1):
-        w.writerow([i,x.get("trend"),x.get("rsi"),x.get("wick_tol"),x.get("max_loss"),"Yes" if x.get("prev_green") else "No",x.get("hold_days"),x.get("min_profit_pct",0),x.get("pullback_pct",0),x.get("trades"),x.get("wins"),round(x.get("win_rate",0),2),x.get("profit_exits"),x.get("sl_hits"),round(x.get("net_pnl",0),4),round(x.get("end_balance",0),4),round(x.get("max_dd",0),2),round(x.get("score",0),2)])
-    name=f"pullback_entry_test_{result.get('days',365)}days_results.csv"
+        w.writerow([i,x.get("trend"),x.get("rsi"),x.get("wick_tol"),x.get("max_loss"),"Yes" if x.get("prev_green") else "No",x.get("hold_days"),x.get("min_profit_pct",0),x.get("trades"),x.get("wins"),round(x.get("win_rate",0),2),x.get("profit_exits"),x.get("sl_hits"),round(x.get("net_pnl",0),4),round(x.get("end_balance",0),4),round(x.get("max_dd",0),2),round(x.get("score",0),2)])
+    name=f"hamza_combo_test_{result.get('days',365)}days_results.csv"
     return Response(out.getvalue(),mimetype="text/csv",headers={"Content-Disposition":f"attachment; filename={name}"})
 
 @app.get("/api/status")
@@ -274,7 +284,7 @@ def status():
     with lock:return jsonify(state["test"])
 
 HTML=r"""<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>HAMZA PULLBACK ENTRY TEST V2</title><style>
+<title>365D Profit Improvement Test</title><style>
 body{margin:0;background:#071019;color:#eef6ff;font-family:Arial;padding:14px}.w{max-width:1100px;margin:auto}
 .c{background:#111d29;border:1px solid #27394b;border-radius:14px;padding:16px;margin-bottom:12px}.sub{color:#a8bacb;line-height:1.5}
 input{width:120px;padding:11px;border-radius:8px;border:1px solid #3b4d60;background:#09141e;color:white;font-size:17px}
@@ -282,12 +292,12 @@ button{padding:12px 18px;border:0;border-radius:9px;background:#387df3;color:whi
 table{width:100%;border-collapse:collapse}th,td{padding:9px;border-bottom:1px solid #253645;text-align:right;white-space:nowrap}
 th:first-child,td:first-child{text-align:left}.scroll{overflow:auto}.g{color:#6ff0a0}.r{color:#ff9999}
 </style></head><body><div class=w>
-<div class=c><h2>HAMZA PULLBACK ENTRY TEST V2</h2>
-<div class=sub>Signal rules LOCKED hain: EMA20+EMA50, RSI 52–62, Wick 0.10%, Previous Green = Yes. Ab sirf profit/risk management test hoga: HAMZA Best Strategy LOCKED hai. Sirf next-day entry compare hogi: Open, ya Open se 0.25%, 0.50%, 0.75%, 1.00% neeche. Pullback trade tabhi fill hogi jab us din ka Low actual entry level ko touch kare. Future data use nahi hoga. Sab OKX USDT pairs scan honge.</div></div>
+<div class=c><h2>HAMZA STRATEGY COMBO TEST V1</h2>
+<div class=sub>Signal rules LOCKED hain: EMA20+EMA50, RSI 52–62, Wick 0.10%, Previous Green = Yes. Ab sirf profit/risk management test hoga: HAMZA Best Strategy bilkul LOCKED hai. Saath independent DAILY EMA50 Pullback setup test hoga. 3 results: HAMZA only, EMA50 only, aur COMBO. Combo ek waqt mein 1 position rakhega; same-day conflict mein HAMZA ko priority milegi. Target +$360/year hai. Sab OKX USDT pairs scan honge.</div></div>
 <div class=c><b>Backtest Days</b><br><br><input id=days type=number value=365 min=10 max=365>
-<button onclick=run()>Run Pullback Entry Test V2</button> <button id=dl onclick="location.href='/api/download'" style="background:#18a66a">Download Pullback V2 Results</button><div id=msg class=sub style="margin-top:12px"></div><div id=info class=sub></div></div>
-<div class="c scroll"><h3>Pullback Entry Results</h3><table><thead><tr>
-<th>#</th><th>Trend Filter</th><th>RSI</th><th>Wick Tol</th><th>SL</th><th>Prev Green</th><th>Max Hold</th><th>Min EOD Profit</th><th>Pullback %</th><th>Trades</th><th>WR</th><th>EOD Profit</th><th>SL Hits</th><th>Net P/L</th><th>End</th><th>Max DD</th><th>Score</th>
+<button onclick=run()>Run Combo Strategy Test</button> <button id=dl onclick="location.href='/api/download'" style="background:#18a66a">Download Combo Results</button><div id=msg class=sub style="margin-top:12px"></div><div id=info class=sub></div></div>
+<div class="c scroll"><h3>Combo Results</h3><table><thead><tr>
+<th>#</th><th>Trend Filter</th><th>RSI</th><th>Wick Tol</th><th>SL</th><th>Prev Green</th><th>Max Hold</th><th>Min EOD Profit</th><th>Trades</th><th>WR</th><th>EOD Profit</th><th>SL Hits</th><th>Net P/L</th><th>End</th><th>Max DD</th><th>Score</th>
 </tr></thead><tbody id=tb></tbody></table></div>
 </div><script>
 const f=(x,n=2)=>Number(x||0).toFixed(n);
@@ -298,7 +308,7 @@ async function load(){
    info.textContent=`Pairs: ${j.result.pairs_loaded}/${j.result.pairs_found} | Variants: ${j.result.variants} | Profitable: ${j.result.profitable}`;
    tb.innerHTML='';
    (j.result.top||[]).forEach((x,i)=>tb.innerHTML+=`<tr>
-   <td>${i+1}</td><td>${x.trend}</td><td>${x.rsi}</td><td>${f(x.wick_tol,2)}%</td><td>$${f(x.max_loss,0)}</td><td>${x.prev_green?'Yes':'No'}</td><td>${x.hold_days}d</td><td>${f(x.min_profit_pct,2)}%</td><td>${f(x.pullback_pct,2)}%</td>
+   <td>${i+1}</td><td>${x.trend}</td><td>${x.rsi}</td><td>${f(x.wick_tol,2)}%</td><td>$${f(x.max_loss,0)}</td><td>${x.prev_green?'Yes':'No'}</td><td>${x.hold_days}d</td><td>${f(x.min_profit_pct,2)}%</td>
    <td>${x.trades}</td><td>${f(x.win_rate,1)}%</td><td>${x.profit_exits}</td><td>${x.sl_hits}</td>
    <td class="${x.net_pnl>=0?'g':'r'}">$${f(x.net_pnl)}</td><td>$${f(x.end_balance)}</td><td>${f(x.max_dd,1)}%</td><td>${f(x.score,1)}</td></tr>`);
  }
