@@ -1,5 +1,5 @@
 
-import json, threading, time, urllib.parse, urllib.request
+import json, threading, time, urllib.parse, urllib.request, csv, io
 from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, Response, request
 
@@ -245,6 +245,20 @@ def run_api():
         threading.Thread(target=run_test,args=(days,),daemon=True).start()
     return jsonify({"ok":True})
 
+@app.get("/api/download")
+def download_results():
+    with lock:
+        result=state["test"].get("result")
+    if not result:
+        return Response("Pehle backtest complete karein.",status=400,mimetype="text/plain")
+    out=io.StringIO()
+    w=csv.writer(out)
+    w.writerow(["Rank","Trend Filter","RSI","Wick Tol %","SL $","Prev Green","Max Hold Days","Trades","Wins","Win Rate %","EOD Profit","SL Hits","Net P/L $","End Balance $","Max DD %","Score"])
+    for i,x in enumerate(result.get("top",[]),1):
+        w.writerow([i,x.get("trend"),x.get("rsi"),x.get("wick_tol"),x.get("max_loss"),"Yes" if x.get("prev_green") else "No",x.get("hold_days"),x.get("trades"),x.get("wins"),round(x.get("win_rate",0),2),x.get("profit_exits"),x.get("sl_hits"),round(x.get("net_pnl",0),4),round(x.get("end_balance",0),4),round(x.get("max_dd",0),2),round(x.get("score",0),2)])
+    name=f"fine_tune_{result.get('days',180)}days_full_results.csv"
+    return Response(out.getvalue(),mimetype="text/csv",headers={"Content-Disposition":f"attachment; filename={name}"})
+
 @app.get("/api/status")
 def status():
     with lock:return jsonify(state["test"])
@@ -261,7 +275,7 @@ th:first-child,td:first-child{text-align:left}.scroll{overflow:auto}.g{color:#6f
 <div class=c><h2>EMA20+EMA50 — 180D Fine Tune</h2>
 <div class=sub>EMA20+EMA50 trend filter fixed hai. Ab RSI, Wick Tol aur SL ko fine-tune karega. Previous candle Green = Yes aur Max Hold = 1 day fixed hain. Sab OKX USDT pairs scan honge.</div></div>
 <div class=c><b>Backtest Days</b><br><br><input id=days type=number value=180 min=10 max=180>
-<button onclick=run()>Run 180D Fine-Tune</button><div id=msg class=sub style="margin-top:12px"></div><div id=info class=sub></div></div>
+<button onclick=run()>Run 180D Fine-Tune</button> <button id=dl onclick="location.href='/api/download'" style="background:#18a66a">Download Full Result CSV</button><div id=msg class=sub style="margin-top:12px"></div><div id=info class=sub></div></div>
 <div class="c scroll"><h3>Winner Result</h3><table><thead><tr>
 <th>#</th><th>Trend Filter</th><th>RSI</th><th>Wick Tol</th><th>SL</th><th>Prev Green</th><th>Max Hold</th><th>Trades</th><th>WR</th><th>EOD Profit</th><th>SL Hits</th><th>Net P/L</th><th>End</th><th>Max DD</th><th>Score</th>
 </tr></thead><tbody id=tb></tbody></table></div>
