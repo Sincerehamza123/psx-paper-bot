@@ -101,20 +101,8 @@ def stop_price(entry_raw,entry_exec,qty,max_loss):
     den=(1-SLIP)*(1-FEE)
     return max(0.0,min(entry_raw,num/den if den>0 else 0.0))
 
-def simulate(cache,days,rsi_lo,rsi_hi,wick_tol_pct,max_loss,prev_green,hold_days,trend_mode,min_profit_pct=0.0,regime_mode='NONE'):
+def simulate(cache,days,rsi_lo,rsi_hi,wick_tol_pct,max_loss,prev_green,hold_days,trend_mode,min_profit_pct=0.0,pullback_pct=0.0):
     cutoff=(datetime.now(timezone.utc).date()-timedelta(days=days)).isoformat()
-    # Cross-market breadth from the same historical daily data only.
-    # No future candles are used.
-    breadth={}
-    for _inst,_rows in cache.items():
-        for _r in _rows:
-            if _r["day"] < cutoff or _r.get("ema20") is None or _r.get("ema50") is None:
-                continue
-            d=breadth.setdefault(_r["day"],[0,0])
-            d[1]+=1
-            if _r["c"] > _r["ema20"] > _r["ema50"]:
-                d[0]+=1
-
     candidates={}
     for inst,rows in cache.items():
         for i in range(1,len(rows)-1):
@@ -132,16 +120,6 @@ def simulate(cache,days,rsi_lo,rsi_hi,wick_tol_pct,max_loss,prev_green,hold_days
             elif trend_mode=="EMA20+EMA50":
                 if s.get("ema20") is None or s.get("ema50") is None or prev.get("ema20") is None: continue
                 if not (s["c"]>s["ema20"]>s["ema50"] and s["ema20"]>prev["ema20"]): continue
-            # Market regime / breadth filter on SIGNAL DAY.
-            up,total_b=breadth.get(s["day"],[0,0])
-            breadth_pct=(up/total_b*100) if total_b else 0
-            if regime_mode=="BREADTH40" and breadth_pct < 40: continue
-            if regime_mode=="BREADTH50" and breadth_pct < 50: continue
-            if regime_mode=="BREADTH60" and breadth_pct < 60: continue
-            if regime_mode=="BREADTH_RISING":
-                p_up,p_total=breadth.get(prev["day"],[0,0])
-                p_pct=(p_up/p_total*100) if p_total else 0
-                if not (breadth_pct >= 40 and breadth_pct > p_pct): continue
             score=(s["c"]-s["o"])/s["o"]*100 + (s["rsi"]-rsi_lo)/max(1,(rsi_hi-rsi_lo))
             candidates.setdefault(nxt["day"],[]).append({"coin":inst,"signal":s,"entry_row":nxt,"score":score})
 
@@ -216,7 +194,7 @@ def run_test(days):
             except Exception:
                 pass
 
-        # HAMZA BEST STRATEGY remains LOCKED.
+        # HAMZA BEST STRATEGY stays LOCKED.
         rsi_lo,rsi_hi=52,63
         wick_tol=0.05
         max_loss=2.75
@@ -225,20 +203,20 @@ def run_test(days):
         trend_mode="EMA20+EMA50"
         min_profit_pct=0.60
 
-        # Only market regime changes.
-        regime_modes=["NONE","BREADTH40","BREADTH50","BREADTH60","BREADTH_RISING"]
-        total=len(regime_modes)
+        # Next-day entry: OPEN baseline vs limit pullbacks below OPEN.
+        pullbacks=[0.00,0.25,0.50,0.75,1.00]
+        total=len(pullbacks)
         results=[]; n=0
 
-        for regime in regime_modes:
+        for pb in pullbacks:
             n+=1
             with lock:
-                state["test"]["progress"]=f"Testing market regime {n}/{total}: {regime}"
-            r=simulate(cache,days,rsi_lo,rsi_hi,wick_tol,max_loss,prev_green,hold_days,trend_mode,min_profit_pct,regime)
+                state["test"]["progress"]=f"Testing pullback entry {n}/{total}: {pb:.2f}%"
+            r=simulate(cache,days,rsi_lo,rsi_hi,wick_tol,max_loss,prev_green,hold_days,trend_mode,min_profit_pct,pb)
             r.update({
                 "rsi":"52-63","wick_tol":wick_tol,"max_loss":max_loss,
                 "prev_green":True,"hold_days":hold_days,"trend":trend_mode,
-                "min_profit_pct":min_profit_pct,"regime":regime
+                "min_profit_pct":min_profit_pct,"pullback_pct":pb
             })
             r["monthly_avg"]=r["net_pnl"]/12.0
             r["target_gap"]=r["net_pnl"]-360.0
@@ -299,11 +277,11 @@ button{padding:12px 18px;border:0;border-radius:9px;background:#387df3;color:whi
 table{width:100%;border-collapse:collapse}th,td{padding:9px;border-bottom:1px solid #253645;text-align:right;white-space:nowrap}
 th:first-child,td:first-child{text-align:left}.scroll{overflow:auto}.g{color:#6ff0a0}.r{color:#ff9999}
 </style></head><body><div class=w>
-<div class=c><h2>HAMZA MARKET REGIME OPTIMIZER V1</h2>
-<div class=sub>Signal rules LOCKED hain: EMA20+EMA50, RSI 52–62, Wick 0.10%, Previous Green = Yes. Ab sirf profit/risk management test hoga: HAMZA Best Strategy LOCKED hai. Sirf market regime filter compare hoga: NONE vs market breadth 40%, 50%, 60%, aur Breadth Rising. Breadth = kitne OKX USDT pairs signal day par Close > EMA20 > EMA50 hain. Future data use nahi hoga. Sab OKX USDT pairs scan honge.</div></div>
+<div class=c><h2>HAMZA PULLBACK ENTRY TEST V1</h2>
+<div class=sub>Signal rules LOCKED hain: EMA20+EMA50, RSI 52–62, Wick 0.10%, Previous Green = Yes. Ab sirf profit/risk management test hoga: HAMZA Best Strategy LOCKED hai. Sirf next-day entry compare hogi: Open, ya Open se 0.25%, 0.50%, 0.75%, 1.00% neeche. Pullback trade tabhi fill hogi jab us din ka Low actual entry level ko touch kare. Future data use nahi hoga. Sab OKX USDT pairs scan honge.</div></div>
 <div class=c><b>Backtest Days</b><br><br><input id=days type=number value=365 min=10 max=365>
-<button onclick=run()>Run Market Regime Test</button> <button id=dl onclick="location.href='/api/download'" style="background:#18a66a">Download Market Regime Results</button><div id=msg class=sub style="margin-top:12px"></div><div id=info class=sub></div></div>
-<div class="c scroll"><h3>Market Regime Results</h3><table><thead><tr>
+<button onclick=run()>Run Pullback Entry Test</button> <button id=dl onclick="location.href='/api/download'" style="background:#18a66a">Download Pullback Entry Results</button><div id=msg class=sub style="margin-top:12px"></div><div id=info class=sub></div></div>
+<div class="c scroll"><h3>Pullback Entry Results</h3><table><thead><tr>
 <th>#</th><th>Trend Filter</th><th>RSI</th><th>Wick Tol</th><th>SL</th><th>Prev Green</th><th>Max Hold</th><th>Min EOD Profit</th><th>Trades</th><th>WR</th><th>EOD Profit</th><th>SL Hits</th><th>Net P/L</th><th>End</th><th>Max DD</th><th>Score</th>
 </tr></thead><tbody id=tb></tbody></table></div>
 </div><script>
