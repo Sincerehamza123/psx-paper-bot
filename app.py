@@ -101,8 +101,20 @@ def stop_price(entry_raw,entry_exec,qty,max_loss):
     den=(1-SLIP)*(1-FEE)
     return max(0.0,min(entry_raw,num/den if den>0 else 0.0))
 
-def simulate(cache,days,rsi_lo,rsi_hi,wick_tol_pct,max_loss,prev_green,hold_days,trend_mode,min_profit_pct=0.0,max_positions=1):
+def simulate(cache,days,rsi_lo,rsi_hi,wick_tol_pct,max_loss,prev_green,hold_days,trend_mode,min_profit_pct=0.0,regime_mode='NONE'):
     cutoff=(datetime.now(timezone.utc).date()-timedelta(days=days)).isoformat()
+    # Cross-market breadth from the same historical daily data only.
+    # No future candles are used.
+    breadth={}
+    for _inst,_rows in cache.items():
+        for _r in _rows:
+            if _r["day"] < cutoff or _r.get("ema20") is None or _r.get("ema50") is None:
+                continue
+            d=breadth.setdefault(_r["day"],[0,0])
+            d[1]+=1
+            if _r["c"] > _r["ema20"] > _r["ema50"]:
+                d[0]+=1
+
     candidates={}
     for inst,rows in cache.items():
         for i in range(1,len(rows)-1):
@@ -110,97 +122,83 @@ def simulate(cache,days,rsi_lo,rsi_hi,wick_tol_pct,max_loss,prev_green,hold_days
             if s["day"]<cutoff or s["rsi"] is None: continue
             if prev_green and not (prev["c"]>prev["o"]): continue
             if not (s["c"]>s["o"]): continue
+            # wick tolerance: low can be at most X% below open
             if s["l"] < s["o"]*(1-wick_tol_pct/100.0): continue
             if not (rsi_lo < s["rsi"] < rsi_hi): continue
+            # Trend filter uses SIGNAL day only (no future data).
             if trend_mode=="EMA20":
                 if s.get("ema20") is None or prev.get("ema20") is None: continue
                 if not (s["c"]>s["ema20"] and s["ema20"]>prev["ema20"]): continue
             elif trend_mode=="EMA20+EMA50":
                 if s.get("ema20") is None or s.get("ema50") is None or prev.get("ema20") is None: continue
                 if not (s["c"]>s["ema20"]>s["ema50"] and s["ema20"]>prev["ema20"]): continue
+            # Market regime / breadth filter on SIGNAL DAY.
+            up,total_b=breadth.get(s["day"],[0,0])
+            breadth_pct=(up/total_b*100) if total_b else 0
+            if regime_mode=="BREADTH40" and breadth_pct < 40: continue
+            if regime_mode=="BREADTH50" and breadth_pct < 50: continue
+            if regime_mode=="BREADTH60" and breadth_pct < 60: continue
+            if regime_mode=="BREADTH_RISING":
+                p_up,p_total=breadth.get(prev["day"],[0,0])
+                p_pct=(p_up/p_total*100) if p_total else 0
+                if not (breadth_pct >= 40 and breadth_pct > p_pct): continue
             score=(s["c"]-s["o"])/s["o"]*100 + (s["rsi"]-rsi_lo)/max(1,(rsi_hi-rsi_lo))
             candidates.setdefault(nxt["day"],[]).append({"coin":inst,"signal":s,"entry_row":nxt,"score":score})
 
     equity=START_CAPITAL; peak=START_CAPITAL; maxdd=0.0
-    trades=[]; open_positions=[]
+    trades=[]; open_pos=None
     all_days=sorted({r["day"] for rows in cache.values() for r in rows if r["day"]>=cutoff})
     rowmap={inst:{r["day"]:r for r in rows} for inst,rows in cache.items()}
 
-    # IMPORTANT: 2/3 slots do NOT multiply leverage.
-    # The same total 5x exposure and the same total $2.75 stop budget are shared across slots.
-    slot_notional_cap=(START_CAPITAL*LEVERAGE)/max_positions
-    slot_loss=max_loss/max_positions
-
     for day in all_days:
-        # First manage every open position.
-        survivors=[]
-        for pos in open_positions:
-            row=rowmap[pos["coin"]].get(day)
-            if row is None:
-                survivors.append(pos); continue
-            held=(datetime.fromisoformat(day).date()-datetime.fromisoformat(pos["entry_day"]).date()).days
-            reason=None; exit_exec=None
-            if row["l"]<=pos["stop_raw"]:
-                reason=f"${slot_loss:g} SLOT SL"; exit_exec=pos["stop_raw"]*(1-SLIP)
-            elif row["c"] >= pos["entry_raw"]*(1+min_profit_pct/100.0):
-                reason=f"EOD PROFIT {min_profit_pct:g}%+"; exit_exec=row["c"]*(1-SLIP)
-            elif held>=hold_days:
-                reason=f"MAX {hold_days}D EXIT"; exit_exec=row["c"]*(1-SLIP)
-
-            if reason:
-                q=pos["qty"]
-                net=q*(exit_exec-pos["entry_exec"])-FEE*q*pos["entry_exec"]-FEE*q*exit_exec
-                equity+=net
-                trades.append({"coin":pos["coin"],"signal_day":pos["signal_day"],"entry_day":pos["entry_day"],"exit_day":day,"reason":reason,"net":net})
-            else:
-                survivors.append(pos)
-        open_positions=survivors
-
-        peak=max(peak,equity)
-        if peak>0: maxdd=max(maxdd,(peak-equity)/peak*100)
-
-        # Fill free slots with the highest-ranked different coins for this day.
-        if equity>0 and day in candidates and len(open_positions)<max_positions:
-            held_coins={p["coin"] for p in open_positions}
-            picks=[p for p in sorted(candidates[day],key=lambda x:x["score"],reverse=True) if p["coin"] not in held_coins]
-            free=max_positions-len(open_positions)
-
-            for pick in picks[:free]:
-                e=pick["entry_row"]; entry_raw=e["o"]; entry_exec=entry_raw*(1+SLIP)
-                # Shared 5x exposure budget: each slot gets at most 1/N of the original capacity.
-                per_slot_notional=min(slot_notional_cap,(equity*LEVERAGE)/max_positions)
-                if per_slot_notional<=0: continue
-                qty=per_slot_notional/entry_exec
-                sp=stop_price(entry_raw,entry_exec,qty,slot_loss)
-                pos={"coin":pick["coin"],"signal_day":pick["signal"]["day"],"entry_day":day,
-                     "entry_raw":entry_raw,"entry_exec":entry_exec,"qty":qty,"stop_raw":sp}
-
-                # Conservative daily-OHLC ordering: SL first, then EOD profit.
-                row=e; reason=None; exit_exec=None
-                if row["l"]<=sp:
-                    reason=f"${slot_loss:g} SLOT SL"; exit_exec=sp*(1-SLIP)
-                elif row["c"] >= entry_raw*(1+min_profit_pct/100.0):
+        if open_pos is not None:
+            row=rowmap[open_pos["coin"]].get(day)
+            if row is not None:
+                held=(datetime.fromisoformat(day).date()-datetime.fromisoformat(open_pos["entry_day"]).date()).days
+                reason=None; exit_exec=None
+                if row["l"]<=open_pos["stop_raw"]:
+                    reason=f"${max_loss:g} SL"; exit_exec=open_pos["stop_raw"]*(1-SLIP)
+                elif row["c"] >= open_pos["entry_raw"]*(1+min_profit_pct/100.0):
                     reason=f"EOD PROFIT {min_profit_pct:g}%+"; exit_exec=row["c"]*(1-SLIP)
-
+                elif held>=hold_days:
+                    reason=f"MAX {hold_days}D EXIT"; exit_exec=row["c"]*(1-SLIP)
                 if reason:
-                    net=qty*(exit_exec-entry_exec)-FEE*qty*entry_exec-FEE*qty*exit_exec
+                    q=open_pos["qty"]
+                    net=q*(exit_exec-open_pos["entry_exec"])-FEE*q*open_pos["entry_exec"]-FEE*q*exit_exec
                     equity+=net
-                    trades.append({"coin":pick["coin"],"signal_day":pick["signal"]["day"],"entry_day":day,"exit_day":day,"reason":reason,"net":net})
-                else:
-                    open_positions.append(pos)
+                    trades.append({"coin":open_pos["coin"],"signal_day":open_pos["signal_day"],"entry_day":open_pos["entry_day"],"exit_day":day,"reason":reason,"net":net})
+                    open_pos=None
+                    peak=max(peak,equity)
+                    if peak>0:maxdd=max(maxdd,(peak-equity)/peak*100)
 
+        if open_pos is None and equity>0 and day in candidates:
+            pick=sorted(candidates[day],key=lambda x:x["score"],reverse=True)[0]
+            e=pick["entry_row"]; entry_raw=e["o"]; entry_exec=entry_raw*(1+SLIP)
+            notional=min(START_CAPITAL*LEVERAGE,equity*LEVERAGE)
+            qty=notional/entry_exec
+            sp=stop_price(entry_raw,entry_exec,qty,max_loss)
+            open_pos={"coin":pick["coin"],"signal_day":pick["signal"]["day"],"entry_day":day,"entry_raw":entry_raw,"entry_exec":entry_exec,"qty":qty,"stop_raw":sp}
+
+            # same-day exit
+            row=e; reason=None; exit_exec=None
+            if row["l"]<=sp:
+                reason=f"${max_loss:g} SL"; exit_exec=sp*(1-SLIP)
+            elif row["c"] >= entry_raw*(1+min_profit_pct/100.0):
+                reason=f"EOD PROFIT {min_profit_pct:g}%+"; exit_exec=row["c"]*(1-SLIP)
+            if reason:
+                net=qty*(exit_exec-entry_exec)-FEE*qty*entry_exec-FEE*qty*exit_exec
+                equity+=net
+                trades.append({"coin":open_pos["coin"],"signal_day":open_pos["signal_day"],"entry_day":day,"exit_day":day,"reason":reason,"net":net})
+                open_pos=None
                 peak=max(peak,equity)
-                if peak>0: maxdd=max(maxdd,(peak-equity)/peak*100)
+                if peak>0:maxdd=max(maxdd,(peak-equity)/peak*100)
 
     wins=sum(1 for t in trades if t["net"]>0)
     return {
         "trades":len(trades),"wins":wins,"win_rate":wins/len(trades)*100 if trades else 0,
         "net_pnl":equity-START_CAPITAL,"end_balance":equity,"max_dd":maxdd,
         "sl_hits":sum(1 for t in trades if "SL" in t["reason"]),
-        "profit_exits":sum(1 for t in trades if str(t["reason"]).startswith("EOD PROFIT")),
-        "max_positions":max_positions,
-        "slot_notional":slot_notional_cap,
-        "slot_loss":slot_loss
+        "profit_exits":sum(1 for t in trades if str(t["reason"]).startswith("EOD PROFIT"))
     }
 
 def run_test(days):
@@ -218,7 +216,7 @@ def run_test(days):
             except Exception:
                 pass
 
-        # HAMZA BEST STRATEGY rules remain LOCKED.
+        # HAMZA BEST STRATEGY remains LOCKED.
         rsi_lo,rsi_hi=52,63
         wick_tol=0.05
         max_loss=2.75
@@ -227,21 +225,20 @@ def run_test(days):
         trend_mode="EMA20+EMA50"
         min_profit_pct=0.60
 
-        # Test trade frequency without artificially multiplying leverage/risk.
-        # Total 5x exposure and total $2.75 stop budget are SHARED across slots.
-        position_opts=[1,2,3]
-        total=len(position_opts)
+        # Only market regime changes.
+        regime_modes=["NONE","BREADTH40","BREADTH50","BREADTH60","BREADTH_RISING"]
+        total=len(regime_modes)
         results=[]; n=0
 
-        for mp in position_opts:
+        for regime in regime_modes:
             n+=1
             with lock:
-                state["test"]["progress"]=f"Testing simultaneous positions {mp}/3"
-            r=simulate(cache,days,rsi_lo,rsi_hi,wick_tol,max_loss,prev_green,hold_days,trend_mode,min_profit_pct,mp)
+                state["test"]["progress"]=f"Testing market regime {n}/{total}: {regime}"
+            r=simulate(cache,days,rsi_lo,rsi_hi,wick_tol,max_loss,prev_green,hold_days,trend_mode,min_profit_pct,regime)
             r.update({
                 "rsi":"52-63","wick_tol":wick_tol,"max_loss":max_loss,
                 "prev_green":True,"hold_days":hold_days,"trend":trend_mode,
-                "min_profit_pct":min_profit_pct,"max_positions":mp
+                "min_profit_pct":min_profit_pct,"regime":regime
             })
             r["monthly_avg"]=r["net_pnl"]/12.0
             r["target_gap"]=r["net_pnl"]-360.0
@@ -283,9 +280,9 @@ def download_results():
         return Response("Pehle backtest complete karein.",status=400,mimetype="text/plain")
     out=io.StringIO()
     w=csv.writer(out)
-    w.writerow(["Rank","Trend Filter","RSI","Wick Tol %","SL $","Prev Green","Max Hold Days","Min EOD Profit %","Max Positions","Trades","Wins","Win Rate %","EOD Profit","SL Hits","Net P/L $","End Balance $","Max DD %","Score"])
+    w.writerow(["Rank","Trend Filter","RSI","Wick Tol %","SL $","Prev Green","Max Hold Days","Min EOD Profit %","Trades","Wins","Win Rate %","EOD Profit","SL Hits","Net P/L $","End Balance $","Max DD %","Score"])
     for i,x in enumerate(result.get("top",[]),1):
-        w.writerow([i,x.get("trend"),x.get("rsi"),x.get("wick_tol"),x.get("max_loss"),"Yes" if x.get("prev_green") else "No",x.get("hold_days"),x.get("min_profit_pct",0),x.get("max_positions",1),x.get("trades"),x.get("wins"),round(x.get("win_rate",0),2),x.get("profit_exits"),x.get("sl_hits"),round(x.get("net_pnl",0),4),round(x.get("end_balance",0),4),round(x.get("max_dd",0),2),round(x.get("score",0),2)])
+        w.writerow([i,x.get("trend"),x.get("rsi"),x.get("wick_tol"),x.get("max_loss"),"Yes" if x.get("prev_green") else "No",x.get("hold_days"),x.get("min_profit_pct",0),x.get("trades"),x.get("wins"),round(x.get("win_rate",0),2),x.get("profit_exits"),x.get("sl_hits"),round(x.get("net_pnl",0),4),round(x.get("end_balance",0),4),round(x.get("max_dd",0),2),round(x.get("score",0),2)])
     name=f"winner_validation_{result.get('days',365)}days_full_results.csv"
     return Response(out.getvalue(),mimetype="text/csv",headers={"Content-Disposition":f"attachment; filename={name}"})
 
@@ -302,11 +299,11 @@ button{padding:12px 18px;border:0;border-radius:9px;background:#387df3;color:whi
 table{width:100%;border-collapse:collapse}th,td{padding:9px;border-bottom:1px solid #253645;text-align:right;white-space:nowrap}
 th:first-child,td:first-child{text-align:left}.scroll{overflow:auto}.g{color:#6ff0a0}.r{color:#ff9999}
 </style></head><body><div class=w>
-<div class=c><h2>HAMZA MULTI-POSITION TEST V1</h2>
-<div class=sub>Signal rules LOCKED hain: EMA20+EMA50, RSI 52–62, Wick 0.10%, Previous Green = Yes. Ab sirf profit/risk management test hoga: HAMZA Best Strategy LOCKED hai. Ab 1 vs 2 vs 3 simultaneous positions test hongi. Fair comparison ke liye total leverage 5x hi rahega aur total $2.75 stop-risk budget slots mein divide hoga — leverage artificially increase nahi hoga. Sab OKX USDT pairs scan honge.</div></div>
+<div class=c><h2>HAMZA MARKET REGIME OPTIMIZER V1</h2>
+<div class=sub>Signal rules LOCKED hain: EMA20+EMA50, RSI 52–62, Wick 0.10%, Previous Green = Yes. Ab sirf profit/risk management test hoga: HAMZA Best Strategy LOCKED hai. Sirf market regime filter compare hoga: NONE vs market breadth 40%, 50%, 60%, aur Breadth Rising. Breadth = kitne OKX USDT pairs signal day par Close > EMA20 > EMA50 hain. Future data use nahi hoga. Sab OKX USDT pairs scan honge.</div></div>
 <div class=c><b>Backtest Days</b><br><br><input id=days type=number value=365 min=10 max=365>
-<button onclick=run()>Run 1 vs 2 vs 3 Position Test</button> <button id=dl onclick="location.href='/api/download'" style="background:#18a66a">Download Multi-Position Results</button><div id=msg class=sub style="margin-top:12px"></div><div id=info class=sub></div></div>
-<div class="c scroll"><h3>1 vs 2 vs 3 Position Results</h3><table><thead><tr>
+<button onclick=run()>Run Market Regime Test</button> <button id=dl onclick="location.href='/api/download'" style="background:#18a66a">Download Market Regime Results</button><div id=msg class=sub style="margin-top:12px"></div><div id=info class=sub></div></div>
+<div class="c scroll"><h3>Market Regime Results</h3><table><thead><tr>
 <th>#</th><th>Trend Filter</th><th>RSI</th><th>Wick Tol</th><th>SL</th><th>Prev Green</th><th>Max Hold</th><th>Min EOD Profit</th><th>Trades</th><th>WR</th><th>EOD Profit</th><th>SL Hits</th><th>Net P/L</th><th>End</th><th>Max DD</th><th>Score</th>
 </tr></thead><tbody id=tb></tbody></table></div>
 </div><script>
